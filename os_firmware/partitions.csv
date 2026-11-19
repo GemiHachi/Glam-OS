@@ -1,0 +1,10 @@
+# G'lam OS Partition Table for ESP32-S3 (16MB Flash)
+# Flash stores ONLY the OS kernel (ota_0/ota_1 for OS self-OTA) & internal system resources.
+# User Apps (.elf / .gla / compat .spk) live on the external TF card (/sdcard/apps/).
+# Name,     Type, SubType, Offset,   Size,   Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  4M,
+ota_1,      app,  ota_1,   0x420000, 4M,
+storage,    data, fat,     ,         7M,

@@ -1,0 +1,36 @@
+idf_component_register(
+    SRCS
+        "os_main.c"
+        "os_spk_installer.c"
+        "wifi_portal.c"
+        "hub_player.c"
+        "hub_protocol.c"
+        "cover_fetcher.c"
+        "netease_api.c"
+        "lrc_parser.c"
+        "ui/os_ui.c"
+        "ui/os_kbd24.c"
+        "ui/ui_manager.c"
+        "ui/ui_font_cjk_14.c"
+    INCLUDE_DIRS
+        "."
+        "ui"
+    REQUIRES
+        bsp
+        swift_abi
+        lvgl
+        esp_lvgl_port
+        json
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        lwip
+        driver
+        vfs
+        fatfs
+        esp_http_client
+        esp_http_server
+        mbedtls
+        esp_rom
+)

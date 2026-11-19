@@ -1,0 +1,13 @@
+# ESP-IDF build & managed components cache
+os_firmware/build/
+os_firmware/managed_components/
+
+# Local legacy archive & backups
+legacy_archive/
+
+# Python / IDE caches
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+Thumbs.db

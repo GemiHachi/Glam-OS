@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "src/bsp_board.c"
+        "src/bsp_sdcard.c"
+        "src/bsp_audio.c"
+        "src/bsp_system.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        driver
+        esp_hw_support
+        esp_lcd
+        fatfs
+        vfs
+        sdmmc
+        esp_codec_dev
+        esp_lvgl_port
+        esp_lcd_touch_ft5x06
+        lvgl
+)

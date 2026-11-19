@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "src/swift_elf_loader.c"
+        "src/swift_os_abi.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bsp
+        lvgl
+        esp_lvgl_port
+        esp_mm
+        esp_wifi
+        esp_netif
+        fatfs
+        vfs
+)
