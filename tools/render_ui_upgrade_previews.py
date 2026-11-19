@@ -1,8 +1,8 @@
 """
-Render clean, modern, normal-palette pure-Chinese UI preview sheets for SWIFT OS.
+Render clean, modern, normal-palette pure-Chinese UI preview sheets for G'lam OS.
 
 Outputs 5 high-DPI (960x720, 3x supersampled from 320x240 logical coordinates)
-PNGs directly to the active artifact directory so previews match os_ui.c verbatim:
+PNGs directly to docs/images/ so previews match os_ui.c verbatim:
   - ui_v2_1_bento_home.png
   - ui_v2_2_music_studio.png
   - ui_v2_3_music_discovery.png
@@ -24,7 +24,7 @@ LOGICAL_H = 240
 W = LOGICAL_W * S  # 960
 H = LOGICAL_H * S  # 720
 
-OUT_DIR = r"C:\Users\Mark\.gemini\antigravity\brain\57b47b3f-b35a-45a0-abc7-9feed4f0e94e"
+OUT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs", "images"))
 
 FONT_REG_PATH = r"C:\Windows\Fonts\msyh.ttc"
 FONT_BOLD_PATH = r"C:\Windows\Fonts\msyhbd.ttc"
@@ -197,7 +197,7 @@ THEME_CLASSIC_DARK = Theme(
 )
 
 THEME_CLEAN_LIGHT = Theme(
-    name="清爽浅色",
+    name="初雪",
     sub="日间主题 · 纯净浅灰白底 + 标准系统蓝",
     is_light=True,
     bg_top=0xF2F4F8,
@@ -228,31 +228,31 @@ THEME_CLEAN_LIGHT = Theme(
 )
 
 THEME_SOFT_TEAL = Theme(
-    name="柔和青绿",
-    sub="护眼主题 · 深岩灰表面 + 自然青绿",
+    name="深邃",
+    sub="OLED 主题 · 纯黑基底 + 澄澈系统蓝",
     is_light=False,
-    bg_top=0x141819,
-    bg_bot=0x181D1F,
-    card_top=0x1F2628,
-    card_bot=0x1B2123,
-    card_border=0x2D373A,
-    card_hi=0x39464A,
-    alt_top=0x232C2F,
-    alt_bot=0x1C2427,
-    alt_border=0x334044,
-    text_pri=0xF1F5F4,
-    text_sec=0x95A5A2,
-    text_mut=0x647471,
-    accent=0x14B886,
-    accent_dark=0x0E936A,
-    accent_tint=0x152E28,
-    accent_border=0x236B56,
+    bg_top=0x000000,
+    bg_bot=0x000000,
+    card_top=0x121214,
+    card_bot=0x0C0C0E,
+    card_border=0x26262A,
+    card_hi=0x303036,
+    alt_top=0x1A1A1E,
+    alt_bot=0x121214,
+    alt_border=0x2A2A30,
+    text_pri=0xFFFFFF,
+    text_sec=0xA1A1AA,
+    text_mut=0x666670,
+    accent=0x3B82F6,
+    accent_dark=0x2563EB,
+    accent_tint=0x0D1B33,
+    accent_border=0x254E8C,
     status_ok=0x22C55E,
-    dock_bg=0x171D1E,
-    dock_border=0x2B3538,
-    lcd_top=0x161B1D,
-    lcd_bot=0x131719,
-    lcd_border=0x263033,
+    dock_bg=0x000000,
+    dock_border=0x26262A,
+    lcd_top=0x08080A,
+    lcd_bot=0x050507,
+    lcd_border=0x202024,
     lcd_fg=0xF1F5F4,
     lcd_sub=0x95A5A2,
     lip_shadow=0x0B0E0F,
@@ -422,8 +422,8 @@ def draw_custom_racer_icon(canvas: Image.Image, x: float, y: float, size: float,
 
 def draw_status_bar(canvas: Image.Image, draw: ImageDraw.ImageDraw, theme: Theme, title: str = "系统桌面"):
     bar_bg = theme.card_top if theme.is_light else 0x0F1218
-    if theme.name == "柔和青绿":
-        bar_bg = 0x101415
+    if theme.name == "深邃":
+        bar_bg = 0x000000
     draw_rr(canvas, 0, 0, 320, 22, 0, fill_top=bar_bg, fill_bot=bar_bg, scale=S)
     draw.line([0, 22 * S, 320 * S, 22 * S], fill=rgba(theme.card_border, 190), width=max(1, S // 2))
     draw.ellipse([10 * S, 9 * S, 14 * S, 13 * S], fill=rgba(theme.accent, 255))
@@ -674,8 +674,8 @@ def render_settings_screen(theme: Theme) -> Image.Image:
 
     themes_meta = [
         ("经典深色", "默认主题", 0x12151C, 0x2E7CF6, True, 10),
-        ("清爽浅色", "日间白底", 0xF2F4F8, 0x2563EB, False, 112),
-        ("柔和青绿", "深岩护眼", 0x141819, 0x14B886, False, 214),
+        ("初雪", "日间白底", 0xF2F4F8, 0x2563EB, False, 112),
+        ("深邃", "OLED 纯黑", 0x000000, 0x3B82F6, False, 214),
     ]
     for name, tag, bg_c, acc_c, active, tx in themes_meta:
         ol = theme.accent if active else theme.card_border
@@ -721,7 +721,7 @@ def render_files_screen(theme: Theme) -> Image.Image:
     rows = [
         ("目录", "我的音乐专辑", "包含 12 首音频", "", 88),
         ("音频", "晴天.mp3", "4.2 兆字节 · 呼出音乐", "播放", 136),
-        ("安装包", "racer_v2.spk", "148 千字节 · 含自定义图标", "安装", 184),
+        ("安装包", "racer_v2.gla", "148 千字节 · 含自定义图标", "安装", 184),
     ]
     for tag, name, meta, action, ry in rows:
         draw_rr(canvas, 10, ry, 300, 42, 8, fill_top=theme.card_top, fill_bot=theme.card_bot, outline=theme.card_border, scale=S)
@@ -755,7 +755,7 @@ def build_sheet_v2_2_boundary() -> Image.Image:
     canvas.paste(home_shot, (44, 136))
 
     bullets_left = [
-        "经典深色 / 清爽浅色 / 柔和青绿，正常清爽现代视觉",
+        "经典深色 / 初雪 / 深邃，三套高对比现代视觉主题",
         "音乐/番茄/计算/应用/文件均配标准彩色圆角图标底座",
         "文案全面中文化：无刻意拼接英文缩写与多余角标",
         "优先加载应用目录自带图片，缺省时生成标准彩色图标",
@@ -785,7 +785,7 @@ def build_sheet_v2_2_boundary() -> Image.Image:
 
     bullets_right = [
         "严格零修改：ui_manager.c / .h、ui_theme.h、hub_player.c",
-        "应用包零改动：app_sdk_template/apps/com.swift.music/*",
+        "应用包零改动：app_sdk_template/apps/com.glam.music/*",
         "切入音乐视图时：系统主动隐藏顶部栏与返回主页胶囊",
         "桌面播放卡片仅读取状态回调文字，不干涉音乐应用界面",
     ]
@@ -834,7 +834,7 @@ def build_sheet_v2_5_themes() -> Image.Image:
     draw = ImageDraw.Draw(canvas)
 
     draw_rr(canvas, 20, 16, 920, 50, 10, fill_top=base.card_top, fill_bot=base.card_bot, outline=base.card_border, scale=1)
-    txt(draw, 38, 41, "三套正常现代主题对比（标准彩色图标 · 经典深色 / 清爽浅色 / 柔和青绿）", 5.2, base.text_pri, bold=True, anchor="lm", scale=1)
+    txt(draw, 38, 41, "G'lam OS 三套实时主题对比（标准彩色图标 · 经典深色 / 初雪 / 深邃）", 5.2, base.text_pri, bold=True, anchor="lm", scale=1)
 
     themes = [THEME_CLASSIC_DARK, THEME_CLEAN_LIGHT, THEME_SOFT_TEAL]
     col_w = 294
