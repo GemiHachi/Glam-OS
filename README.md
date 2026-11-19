@@ -65,7 +65,7 @@ G'lam OS 不依赖字节码虚拟机或脚本解释器，而是直接运行原�
 
 | 主桌面与信息卡片（经典深色） | 应用中心与自定义图标解析 |
 | :---: | :---: |
-| ![Home Screen](docs/images/ui_v2_1_bento_home.png) | ![App Center](docs/images/ui_v2_3_music_discovery.png) |
+| ![Home Screen](docs/images/ui_v2_1_home.png) | ![App Center](docs/images/ui_v2_3_music_discovery.png) |
 | **内建工具矩阵（番茄钟 / 计算器 / 设置 / 文件与任务）** | **三套实时主题对比（经典深色 / 初雪 / 深邃）** |
 | ![System Tools](docs/images/ui_v2_4_apps_quad_showcase.png) | ![Theme Palettes](docs/images/ui_v2_5_theme_palettes.png) |
 
@@ -162,7 +162,7 @@ Each `.gla` archive contains a 160-byte binary header (`GLAM` magic, backward-co
 
 | Launcher & Status Cards (Classic Dark) | App Center & Custom Icon Resolution |
 | :---: | :---: |
-| ![Home Screen](docs/images/ui_v2_1_bento_home.png) | ![App Center](docs/images/ui_v2_3_music_discovery.png) |
+| ![Home Screen](docs/images/ui_v2_1_home.png) | ![App Center](docs/images/ui_v2_3_music_discovery.png) |
 | **Built-in System Tools (Pomodoro / Calc / Settings / Files)** | **Real-Time Theme Comparison (Classic Dark / First Snow / Abyssal)** |
 | ![System Tools](docs/images/ui_v2_4_apps_quad_showcase.png) | ![Theme Palettes](docs/images/ui_v2_5_theme_palettes.png) |
 
