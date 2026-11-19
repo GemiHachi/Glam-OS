@@ -1,5 +1,7 @@
 idf_component_register(
     SRCS
+        "src/bsp_profiles.c"
+        "src/bsp_touch_extra.c"
         "src/bsp_board.c"
         "src/bsp_sdcard.c"
         "src/bsp_audio.c"
@@ -17,4 +19,6 @@ idf_component_register(
         esp_lvgl_port
         esp_lcd_touch_ft5x06
         lvgl
+        json
+        nvs_flash
 )

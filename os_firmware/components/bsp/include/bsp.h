@@ -6,6 +6,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "bsp_profiles.h"
 #include "bsp_board.h"
 #include "bsp_sdcard.h"
 #include "bsp_audio.h"

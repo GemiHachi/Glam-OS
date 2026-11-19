@@ -63,12 +63,15 @@ void bsp_system_shutdown(void)
         esp_lcd_panel_disp_on_off(bsp_lcd_get_panel_handle(), false);
     }
 
-    /* Hold active-low backlight pin HIGH so LCD remains completely off in deep sleep */
-    gpio_reset_pin(BSP_LCD_BACKLIGHT);
-    gpio_set_direction(BSP_LCD_BACKLIGHT, GPIO_MODE_OUTPUT);
-    gpio_set_level(BSP_LCD_BACKLIGHT, 1);
-    gpio_hold_en(BSP_LCD_BACKLIGHT);
-    gpio_deep_sleep_hold_en();
+    /* Hold backlight pin in off-state so LCD remains off in deep sleep */
+    const bsp_board_profile_t *prof = bsp_get_active_profile();
+    if (prof->lcd_bl >= 0) {
+        gpio_reset_pin(prof->lcd_bl);
+        gpio_set_direction(prof->lcd_bl, GPIO_MODE_OUTPUT);
+        gpio_set_level(prof->lcd_bl, prof->lcd_bl_active_low ? 1 : 0);
+        gpio_hold_en(prof->lcd_bl);
+        gpio_deep_sleep_hold_en();
+    }
 
     fflush(stdout);
     vTaskDelay(pdMS_TO_TICKS(50));

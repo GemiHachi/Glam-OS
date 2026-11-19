@@ -60,8 +60,10 @@ static void on_uart_preinit_fallback(const char *line)
 static void hw_home_btn_task(void *arg)
 {
     (void)arg;
+    const bsp_board_profile_t *prof = bsp_get_active_profile();
+    int btn_gpio = (prof->home_btn_gpio >= 0) ? prof->home_btn_gpio : GPIO_NUM_0;
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_NUM_0),
+        .pin_bit_mask = (1ULL << btn_gpio),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -71,10 +73,10 @@ static void hw_home_btn_task(void *arg)
 
     int prev = 1;
     while (1) {
-        int cur = gpio_get_level(GPIO_NUM_0);
+        int cur = gpio_get_level(btn_gpio);
         if (prev == 1 && cur == 0) {
             vTaskDelay(pdMS_TO_TICKS(35));
-            if (gpio_get_level(GPIO_NUM_0) == 0) {
+            if (gpio_get_level(btn_gpio) == 0) {
                 os_ui_request_home();
             }
         }

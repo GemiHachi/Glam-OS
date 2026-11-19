@@ -5,6 +5,7 @@
 
 #include "bsp_audio.h"
 #include "bsp_board.h"
+#include "bsp_profiles.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,14 +223,35 @@ esp_err_t bsp_audio_init(void)
         return ESP_OK;
     }
 
+    const bsp_board_profile_t *prof = bsp_get_active_profile();
+    bsp_board_runtime_info_t *rt = bsp_get_runtime_info_mut();
+
+    if (prof->audio_type == BSP_AUDIO_NONE) {
+        snprintf(rt->audio_name, sizeof(rt->audio_name), "无音频芯片 (静音模式)");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "I2C required for ES8311 codec");
+    if (i2c_master_probe(bsp_i2c_get_handle(), (uint8_t)(prof->es8311_addr >> 1), 25) != ESP_OK) {
+        snprintf(rt->audio_name, sizeof(rt->audio_name), "未检测到 ES8311 (静音)");
+        ESP_LOGW(TAG, "ES8311 not found at 0x%02X; disabling audio subsystem", prof->es8311_addr >> 1);
+        return ESP_ERR_NOT_FOUND;
+    }
+
     ESP_RETURN_ON_ERROR(bsp_pca9557_init(), TAG, "PCA9557 required for PA_EN");
+    if (prof->pa_gpio >= 0) {
+        gpio_config_t pa_cfg = {
+            .mode = GPIO_MODE_OUTPUT,
+            .pin_bit_mask = BIT64(prof->pa_gpio),
+        };
+        gpio_config(&pa_cfg);
+    }
 
     /* Ensure PA is initially off to prevent click/pop */
     bsp_pa_en_set(0);
 
-    /* 1. Setup I2S1 Master with larger DMA headroom to survive Wi-Fi / SPI burst jitter */
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BSP_I2S_NUM, I2S_ROLE_MASTER);
+    /* 1. Setup I2S Master with larger DMA headroom to survive Wi-Fi / SPI burst jitter */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(prof->i2s_num, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 8;
     chan_cfg.dma_frame_num = 360;
     chan_cfg.auto_clear = true;
@@ -239,10 +261,10 @@ esp_err_t bsp_audio_init(void)
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(16, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = BSP_I2S_MCLK_IO,
-            .bclk = BSP_I2S_BCK_IO,
-            .ws   = BSP_I2S_WS_IO,
-            .dout = BSP_I2S_DO_IO,
+            .mclk = prof->i2s_mclk,
+            .bclk = prof->i2s_bck,
+            .ws   = prof->i2s_ws,
+            .dout = prof->i2s_dout,
             .din  = GPIO_NUM_NC,
             .invert_flags = {
                 .mclk_inv = false,
@@ -257,7 +279,7 @@ esp_err_t bsp_audio_init(void)
 
     /* 2. Setup Codec Data Interface */
     audio_codec_i2s_cfg_t i2s_data_cfg = {
-        .port = BSP_I2S_NUM,
+        .port = prof->i2s_num,
         .rx_handle = NULL,
         .tx_handle = s_i2s_tx_chan,
     };
@@ -271,7 +293,7 @@ esp_err_t bsp_audio_init(void)
     const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
     audio_codec_i2c_cfg_t i2c_ctrl_cfg = {
         .port = BSP_I2C_NUM,
-        .addr = ES8311_I2C_ADDR,
+        .addr = prof->es8311_addr,
         .bus_handle = bsp_i2c_get_handle(),
     };
     const audio_codec_ctrl_if_t *i2c_ctrl_if = audio_codec_new_i2c_ctrl(&i2c_ctrl_cfg);
@@ -288,7 +310,7 @@ esp_err_t bsp_audio_init(void)
         .pa_pin = GPIO_NUM_NC,
         .pa_reverted = false,
         .master_mode = false,
-        .use_mclk = true,
+        .use_mclk = (prof->i2s_mclk >= 0),
         .digital_mic = false,
         .invert_mclk = false,
         .invert_sclk = false,
@@ -333,8 +355,9 @@ esp_err_t bsp_audio_init(void)
                         TAG, "audio_player_callback_register failed");
 
     s_audio_initialized = true;
-    ESP_LOGI(TAG, "Audio subsystem initialized (I2S1, ES8311 DAC @ 0x%02X, NS4150B PA)",
-             ES8311_I2C_ADDR);
+    snprintf(rt->audio_name, sizeof(rt->audio_name), "ES8311 (0x%02X)", prof->es8311_addr >> 1);
+    ESP_LOGI(TAG, "Audio subsystem initialized (I2S%d, ES8311 DAC @ 0x%02X)",
+             prof->i2s_num, prof->es8311_addr);
     return ESP_OK;
 }
 

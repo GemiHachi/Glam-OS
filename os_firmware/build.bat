@@ -11,7 +11,7 @@ set "FW_DIR=%~dp0"
 set "GLAMOR_BUILD=%FW_DIR%..\..\Glamor\app_sdk_template\build_apps.bat"
 
 if exist "%GLAMOR_BUILD%" (
-    echo [1/3] 先通过 Glamor SDK 编译打包动态 .elf 应用安装包 (.gla)...
+    echo [1/3] 先通过 Glamor SDK 编译打包动态 .elf 应用安装包...
     call "%GLAMOR_BUILD%"
     if errorlevel 1 exit /b 1
 ) else (
