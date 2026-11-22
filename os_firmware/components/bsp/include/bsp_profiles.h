@@ -98,11 +98,13 @@ typedef struct {
     /* Audio */
     bsp_audio_type_t audio_type;
     uint8_t es8311_addr;    /* 8-bit shifted address (e.g. 0x30) */
+    uint8_t es7210_addr;    /* 8-bit shifted address (e.g. 0x82 for 0x41, 0x80 for 0x40, 0 if none) */
     int i2s_num;
     int i2s_mclk;
     int i2s_bck;
     int i2s_ws;
     int i2s_dout;
+    int i2s_din;            /* GPIO_NUM_NC if no I2S microphone ADC */
     int pa_gpio;            /* -1 if managed by expander or none */
     bool pa_active_high;
 

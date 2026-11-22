@@ -57,13 +57,27 @@ static void filtered_touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         if (dx < 0) dx = -dx;
         if (dy < 0) dy = -dy;
 
-        if (s_touch_streak == 0 || dx > 36 || dy > 36) {
+        if (s_touch_streak == 0) {
+            /* First touch frame: require one more consistent frame to reject EMI ghost spike */
             s_touch_candidate = data->point;
             s_touch_streak = 1;
-            data->state = LV_INDEV_STATE_RELEASED; /* Reject single-frame EMI/I2C ghost spike */
+            data->state = LV_INDEV_STATE_RELEASED;
+        } else if (s_touch_streak == 1) {
+            if (dx > 64 || dy > 64) {
+                s_touch_candidate = data->point;
+                data->state = LV_INDEV_STATE_RELEASED;
+            } else {
+                s_touch_streak = 2;
+                s_touch_candidate = data->point;
+            }
         } else {
+            /* Confirmed active touch/drag: never break a fast swipe with fake RELEASED */
+            if (dx > 180 && dy > 140) {
+                data->point = s_touch_candidate; /* Clamp impossible EMI jump */
+            } else {
+                s_touch_candidate = data->point;
+            }
             if (s_touch_streak < 255) s_touch_streak++;
-            s_touch_candidate = data->point;
         }
     } else {
         s_touch_streak = 0;
@@ -155,7 +169,11 @@ esp_err_t bsp_pca9557_set_output_state(uint8_t gpio_bit, uint8_t level)
     } else {
         s_pca9557_output_reg &= ~gpio_bit;
     }
-    return pca9557_write_reg(PCA9557_OUTPUT_PORT, s_pca9557_output_reg);
+    esp_err_t err = pca9557_write_reg(PCA9557_OUTPUT_PORT, s_pca9557_output_reg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "PCA9557 write OUT=0x%02X failed (%s)", s_pca9557_output_reg, esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t bsp_pca9557_get_output_state(uint8_t *val)
@@ -165,6 +183,24 @@ esp_err_t bsp_pca9557_get_output_state(uint8_t *val)
     }
     *val = s_pca9557_output_reg;
     return ESP_OK;
+}
+
+esp_err_t bsp_pca9557_read_hw_regs(uint8_t regs[4])
+{
+    if (!regs) return ESP_ERR_INVALID_ARG;
+    const bsp_board_profile_t *prof = bsp_get_active_profile();
+    if (prof->expander != BSP_EXP_PCA9557) {
+        memset(regs, 0, 4);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    esp_err_t ret = ESP_OK;
+    for (uint8_t r = 0; r < 4; r++) {
+        uint8_t v = 0;
+        esp_err_t e = pca9557_read_reg(r, &v);
+        if (e != ESP_OK) ret = e;
+        regs[r] = v;
+    }
+    return ret;
 }
 
 void bsp_lcd_cs_set(uint8_t level)
@@ -457,6 +493,7 @@ esp_err_t bsp_lvgl_init(void)
 
     /* Initialize LVGL port */
     lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_cfg.task_stack = 8192;
     ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "LVGL port init failed");
 
     /* Add Display */
@@ -495,6 +532,15 @@ esp_err_t bsp_lvgl_init(void)
             s_orig_touch_read_cb = s_disp_indev->driver->read_cb;
             s_disp_indev->driver->read_cb = filtered_touch_read_cb;
         }
+    }
+
+    /* Pre-fill LVGL active screen black before turning backlight on */
+    if (lvgl_port_lock(500)) {
+        lv_obj_t *scr = lv_scr_act();
+        lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+        lv_refr_now(s_disp);
+        lvgl_port_unlock();
     }
 
     /* Turn backlight on */

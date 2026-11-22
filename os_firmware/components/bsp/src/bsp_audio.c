@@ -13,21 +13,46 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "driver/i2s_std.h"
+#include "soc/i2s_struct.h"
+#include "soc/gpio_struct.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "es7210_adc.h"
 #include "audio_player.h"
+#include <math.h>
 
 static const char *TAG = "bsp_audio";
 
 static i2s_chan_handle_t s_i2s_tx_chan = NULL;
+static i2s_chan_handle_t s_i2s_rx_chan = NULL;
 static const audio_codec_data_if_t *s_i2s_data_if = NULL;
 static esp_codec_dev_handle_t s_play_dev = NULL;
+static esp_codec_dev_handle_t s_rec_dev = NULL;
 
 static bool s_audio_initialized = false;
+static bool s_mic_available = false;
+static bool s_rec_opened = false;
+static bool s_voice_active = false;
+static bool s_voice_resume_music = false;
+static bool s_wake_active = false;
+static uint32_t s_cur_i2s_rate = 44100;
+static uint32_t s_wake_hw_rate = 16000;
+static int64_t s_music_clk_guard_us = 0;
+static esp_err_t s_last_write_err = ESP_OK;
+static uint16_t s_last_music_peak = 0;
+static int16_t *s_wake_rx_buf = NULL;
+static size_t s_wake_rx_cap_frames = 0;
+static int16_t *s_wake_mono_buf = NULL;
+static size_t s_wake_mono_cap = 0;
+static uint32_t s_saved_rate = 44100;
+static uint32_t s_saved_ch = 2;
+static uint32_t s_saved_bits = 16;
+static int16_t *s_voice_io_buf = NULL;
 static bsp_audio_state_t s_audio_state = BSP_AUDIO_STATE_STOPPED;
 static uint8_t s_volume = BSP_AUDIO_DEFAULT_VOLUME;
 static bsp_audio_cb_t s_user_event_cb = NULL;
@@ -60,6 +85,7 @@ typedef struct {
 
 static audio_stream_ctx_t *s_stream_ctx = NULL;
 static SemaphoreHandle_t s_stream_closed_sem = NULL;
+static SemaphoreHandle_t s_voice_lock = NULL;
 static volatile bool s_stream_abort_flag = false;
 static volatile bool s_suppress_idle_evt = false;
 
@@ -107,6 +133,36 @@ static uint32_t estimate_file_duration_ms(const char *path)
 }
 
 /******************************************************************************/
+/*                   ES8311 & Shared Full-Duplex I2S Helpers                  */
+/******************************************************************************/
+static void bsp_es8311_ensure_dac_ready(void)
+{
+    if (!s_play_dev) return;
+    /* Guard against es8311_suspend() / soft-reset clearing analog output driver (REG13=0x10)
+     * or DAC power-up registers (REG0D/0E/10/11/12/37). */
+    esp_codec_dev_write_reg(s_play_dev, 0x00, 0x80); /* CSM on, slave mode */
+    esp_codec_dev_write_reg(s_play_dev, 0x01, 0x3F); /* Enable all internal clocks from MCLK */
+    esp_codec_dev_write_reg(s_play_dev, 0x0D, 0x01); /* Analog power up */
+    esp_codec_dev_write_reg(s_play_dev, 0x0E, 0x02); /* Enable analog PGA/DAC bias */
+    esp_codec_dev_write_reg(s_play_dev, 0x10, 0x1F); /* Analog output bias */
+    esp_codec_dev_write_reg(s_play_dev, 0x11, 0x7F); /* Analog reference */
+    esp_codec_dev_write_reg(s_play_dev, 0x12, 0x00); /* Enable DAC */
+    esp_codec_dev_write_reg(s_play_dev, 0x13, 0x10); /* Enable HP/SPK analog output driver (HPSW=1) */
+    esp_codec_dev_write_reg(s_play_dev, 0x37, 0x08); /* DAC ramp rate */
+    esp_codec_dev_set_out_mute(s_play_dev, false);
+    esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+}
+
+static void bsp_rec_close_locked(void)
+{
+    if (s_rec_dev && s_rec_opened) {
+        esp_codec_dev_close(s_rec_dev);
+        s_rec_opened = false;
+    }
+    s_wake_active = false;
+}
+
+/******************************************************************************/
 /*                       Audio Player Interface Callbacks                     */
 /******************************************************************************/
 static esp_err_t audio_player_mute_cb(AUDIO_PLAYER_MUTE_SETTING setting)
@@ -118,10 +174,7 @@ static esp_err_t audio_player_mute_cb(AUDIO_PLAYER_MUTE_SETTING setting)
             esp_codec_dev_set_out_mute(s_play_dev, true);
         }
     } else {
-        if (s_play_dev) {
-            esp_codec_dev_set_out_mute(s_play_dev, false);
-            esp_codec_dev_set_out_vol(s_play_dev, s_volume);
-        }
+        bsp_es8311_ensure_dac_ready();
         bsp_pa_en_set(1);
     }
     return ESP_OK;
@@ -129,11 +182,25 @@ static esp_err_t audio_player_mute_cb(AUDIO_PLAYER_MUTE_SETTING setting)
 
 static esp_err_t audio_player_write_cb(void *audio_buffer, size_t len, size_t *bytes_written, uint32_t timeout_ms)
 {
+    (void)timeout_ms;
     if (!s_play_dev) {
         return ESP_FAIL;
     }
 
+    if (audio_buffer && len >= 4) {
+        const int16_t *p = (const int16_t *)audio_buffer;
+        size_t n = len / sizeof(int16_t);
+        if (n > 128) n = 128;
+        uint16_t pk = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint16_t a = (uint16_t)(p[i] < 0 ? -p[i] : p[i]);
+            if (a > pk) pk = a;
+        }
+        s_last_music_peak = pk;
+    }
+
     esp_err_t ret = esp_codec_dev_write(s_play_dev, audio_buffer, len);
+    s_last_write_err = ret;
     if (ret == ESP_OK) {
         *bytes_written = len;
         s_total_pcm_written += len;
@@ -149,6 +216,11 @@ static esp_err_t audio_player_clk_cb(uint32_t rate, uint32_t bits_cfg, i2s_slot_
         return ESP_FAIL;
     }
 
+    if (s_voice_lock) {
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+    }
+
+    s_music_clk_guard_us = esp_timer_get_time();
     s_sample_rate = rate;
     s_bits_per_sample = bits_cfg;
     s_channels = (ch == I2S_SLOT_MODE_MONO) ? 1 : 2;
@@ -160,6 +232,12 @@ static esp_err_t audio_player_clk_cb(uint32_t rate, uint32_t bits_cfg, i2s_slot_
     ESP_LOGI(TAG, "Audio format set: %ld Hz, %ld-bit, %ld ch (ByteRate: %ld B/s)",
              (long)rate, (long)bits_cfg, (long)s_channels, (long)s_bytes_per_sec);
 
+    /* ALWAYS close shared full-duplex RX before closing TX so esp_codec_dev never
+     * defers TX disable (which would crash in i2s_channel_reconfig_std_slot).
+     * Leave RX closed here to keep Audio Task's 4KB stack light; xz_audio_task
+     * (32KB stack) lazily reopens wake RX at s_cur_i2s_rate. */
+    bsp_rec_close_locked();
+
     esp_codec_dev_sample_info_t fs = {
         .sample_rate = rate,
         .channel = (uint8_t)s_channels,
@@ -167,7 +245,16 @@ static esp_err_t audio_player_clk_cb(uint32_t rate, uint32_t bits_cfg, i2s_slot_
     };
 
     esp_codec_dev_close(s_play_dev);
-    return esp_codec_dev_open(s_play_dev, &fs);
+    esp_err_t ret = esp_codec_dev_open(s_play_dev, &fs);
+    if (ret == ESP_OK) {
+        s_cur_i2s_rate = rate;
+        bsp_es8311_ensure_dac_ready();
+    }
+
+    if (s_voice_lock) {
+        xSemaphoreGive(s_voice_lock);
+    }
+    return ret;
 }
 
 static void audio_player_event_cb(audio_player_cb_ctx_t *ctx)
@@ -219,6 +306,9 @@ static void audio_player_event_cb(audio_player_cb_ctx_t *ctx)
 /******************************************************************************/
 esp_err_t bsp_audio_init(void)
 {
+    if (!s_voice_lock) {
+        s_voice_lock = xSemaphoreCreateMutex();
+    }
     if (s_audio_initialized) {
         return ESP_OK;
     }
@@ -250,12 +340,31 @@ esp_err_t bsp_audio_init(void)
     /* Ensure PA is initially off to prevent click/pop */
     bsp_pa_en_set(0);
 
-    /* 1. Setup I2S Master with larger DMA headroom to survive Wi-Fi / SPI burst jitter */
+    /* 1. Probe optional ES7210 Microphone ADC (0x41 on LCSC SZP S3, 0x40 on S3-BOX-3) */
+    uint8_t es7210_addr = 0;
+    if (prof->i2s_din >= 0) {
+        if (prof->es7210_addr &&
+            i2c_master_probe(bsp_i2c_get_handle(), (uint8_t)(prof->es7210_addr >> 1), 25) == ESP_OK) {
+            es7210_addr = prof->es7210_addr;
+        } else if (i2c_master_probe(bsp_i2c_get_handle(), 0x41, 25) == ESP_OK) {
+            es7210_addr = 0x82;
+        } else if (i2c_master_probe(bsp_i2c_get_handle(), 0x40, 25) == ESP_OK) {
+            es7210_addr = 0x80;
+        }
+    }
+
+    /* Setup I2S Master (Full-duplex when ES7210 is present, TX-only otherwise) */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(prof->i2s_num, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 8;
     chan_cfg.dma_frame_num = 360;
     chan_cfg.auto_clear = true;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, NULL), TAG, "I2S new channel failed");
+    if (es7210_addr != 0) {
+        ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, &s_i2s_rx_chan),
+                            TAG, "I2S full-duplex channel failed");
+    } else {
+        ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, NULL),
+                            TAG, "I2S new channel failed");
+    }
 
     const i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
@@ -265,7 +374,7 @@ esp_err_t bsp_audio_init(void)
             .bclk = prof->i2s_bck,
             .ws   = prof->i2s_ws,
             .dout = prof->i2s_dout,
-            .din  = GPIO_NUM_NC,
+            .din  = (es7210_addr != 0) ? prof->i2s_din : GPIO_NUM_NC,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -274,13 +383,16 @@ esp_err_t bsp_audio_init(void)
         },
     };
 
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_tx_chan, &std_cfg), TAG, "I2S init std mode failed");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s_tx_chan), TAG, "I2S enable failed");
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_tx_chan, &std_cfg), TAG, "I2S TX init std mode failed");
+    if (s_i2s_rx_chan) {
+        ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_rx_chan, &std_cfg), TAG, "I2S RX init std mode failed");
+    }
+    /* Let esp_codec_dev_open() manage i2s_channel_enable/disable so its internal state stays in sync */
 
     /* 2. Setup Codec Data Interface */
     audio_codec_i2s_cfg_t i2s_data_cfg = {
         .port = prof->i2s_num,
-        .rx_handle = NULL,
+        .rx_handle = s_i2s_rx_chan,
         .tx_handle = s_i2s_tx_chan,
     };
     s_i2s_data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
@@ -334,6 +446,9 @@ esp_err_t bsp_audio_init(void)
         return ESP_FAIL;
     }
 
+    /* Keep ES8311 powered across sample-rate switches so es8311_suspend() never resets REG13 */
+    esp_codec_set_disable_when_closed(s_play_dev, false);
+
     /* Set default sample rate and volume */
     esp_codec_dev_sample_info_t fs = {
         .sample_rate = 44100,
@@ -341,7 +456,41 @@ esp_err_t bsp_audio_init(void)
         .bits_per_sample = 16,
     };
     esp_codec_dev_open(s_play_dev, &fs);
-    esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+    s_cur_i2s_rate = 44100;
+    bsp_es8311_ensure_dac_ready();
+
+    /* 3b. Setup Optional ES7210 Microphone ADC (kept closed until voice session starts) */
+    if (es7210_addr != 0 && s_i2s_rx_chan != NULL) {
+        audio_codec_i2c_cfg_t es7210_i2c_cfg = {
+            .port = BSP_I2C_NUM,
+            .addr = es7210_addr,
+            .bus_handle = bsp_i2c_get_handle(),
+        };
+        const audio_codec_ctrl_if_t *es7210_ctrl = audio_codec_new_i2c_ctrl(&es7210_i2c_cfg);
+        if (es7210_ctrl) {
+            es7210_codec_cfg_t es7210_cfg = {
+                .ctrl_if = es7210_ctrl,
+                .master_mode = false,
+                .mic_selected = ES7120_SEL_MIC1 | ES7120_SEL_MIC2,
+                .mclk_src = ES7210_MCLK_FROM_PAD,
+                .mclk_div = 256,
+            };
+            const audio_codec_if_t *es7210_dev = es7210_codec_new(&es7210_cfg);
+            if (es7210_dev) {
+                esp_codec_dev_cfg_t rec_cfg = {
+                    .dev_type = ESP_CODEC_DEV_TYPE_IN,
+                    .codec_if = es7210_dev,
+                    .data_if = s_i2s_data_if,
+                };
+                s_rec_dev = esp_codec_dev_new(&rec_cfg);
+                if (s_rec_dev) {
+                    s_mic_available = true;
+                    ESP_LOGI(TAG, "ES7210 ADC Mic initialized @ 0x%02X (I2S DIN=IO%d)",
+                             es7210_addr >> 1, prof->i2s_din);
+                }
+            }
+        }
+    }
 
     /* 4. Setup esp-audio-player engine */
     audio_player_config_t player_cfg = {
@@ -355,9 +504,13 @@ esp_err_t bsp_audio_init(void)
                         TAG, "audio_player_callback_register failed");
 
     s_audio_initialized = true;
-    snprintf(rt->audio_name, sizeof(rt->audio_name), "ES8311 (0x%02X)", prof->es8311_addr >> 1);
-    ESP_LOGI(TAG, "Audio subsystem initialized (I2S%d, ES8311 DAC @ 0x%02X)",
-             prof->i2s_num, prof->es8311_addr);
+    if (s_mic_available) {
+        snprintf(rt->audio_name, sizeof(rt->audio_name), "ES8311 + ES7210");
+    } else {
+        snprintf(rt->audio_name, sizeof(rt->audio_name), "ES8311 (0x%02X)", prof->es8311_addr >> 1);
+    }
+    ESP_LOGI(TAG, "Audio subsystem initialized (I2S%d, ES8311 DAC @ 0x%02X, Mic=%s)",
+             prof->i2s_num, prof->es8311_addr, s_mic_available ? "ES7210" : "none");
     return ESP_OK;
 }
 
@@ -486,6 +639,30 @@ esp_err_t audio_resume(void)
 {
     if (s_audio_state != BSP_AUDIO_STATE_PAUSED) {
         return ESP_OK;
+    }
+
+    if (s_voice_lock) {
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+    }
+    /* Restore music sample rate & unmute if wake mode had switched I2S1 to 16kHz while paused */
+    if (s_play_dev && !s_voice_active && s_sample_rate > 0 && s_cur_i2s_rate != s_sample_rate) {
+        bsp_rec_close_locked();
+        esp_codec_dev_close(s_play_dev);
+        esp_codec_dev_sample_info_t fs = {
+            .sample_rate = s_sample_rate,
+            .channel = (uint8_t)(s_channels ? s_channels : 2),
+            .bits_per_sample = (uint8_t)(s_bits_per_sample ? s_bits_per_sample : 16),
+        };
+        if (esp_codec_dev_open(s_play_dev, &fs) == ESP_OK) {
+            s_cur_i2s_rate = s_sample_rate;
+            bsp_es8311_ensure_dac_ready();
+        }
+    } else if (s_play_dev && !s_voice_active) {
+        bsp_es8311_ensure_dac_ready();
+    }
+    s_music_clk_guard_us = esp_timer_get_time();
+    if (s_voice_lock) {
+        xSemaphoreGive(s_voice_lock);
     }
 
     bsp_pa_en_set(1);
@@ -963,5 +1140,563 @@ const char *audio_get_current_file(void)
 void audio_register_event_callback(bsp_audio_cb_t cb)
 {
     s_user_event_cb = cb;
+}
+
+/******************************************************************************/
+/*               Full-Duplex Voice & Microphone APIs (XiaoZhi AI)             */
+/******************************************************************************/
+
+bool bsp_audio_has_mic(void)
+{
+    return s_mic_available && (s_rec_dev != NULL);
+}
+
+bool bsp_audio_is_voice_active(void)
+{
+    return s_voice_active;
+}
+
+static void voice_lock(void)
+{
+    if (!s_voice_lock) {
+        s_voice_lock = xSemaphoreCreateMutex();
+    }
+    if (s_voice_lock) {
+        xSemaphoreTake(s_voice_lock, portMAX_DELAY);
+    }
+}
+
+static void voice_unlock(void)
+{
+    if (s_voice_lock) {
+        xSemaphoreGive(s_voice_lock);
+    }
+}
+
+esp_err_t bsp_audio_voice_begin(uint32_t sample_rate_hz)
+{
+    if (!s_audio_initialized) {
+        ESP_RETURN_ON_ERROR(bsp_audio_init(), TAG, "Voice begin failed: audio not init");
+    }
+    voice_lock();
+    if (!s_play_dev) {
+        voice_unlock();
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (s_voice_active) {
+        voice_unlock();
+        return ESP_OK;
+    }
+    if (sample_rate_hz == 0) {
+        sample_rate_hz = 16000;
+    }
+
+    if (!s_voice_io_buf) {
+        s_voice_io_buf = (int16_t *)heap_caps_calloc(960 * 2, sizeof(int16_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_voice_io_buf) {
+            s_voice_io_buf = (int16_t *)calloc(960 * 2, sizeof(int16_t));
+        }
+        if (!s_voice_io_buf) {
+            voice_unlock();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    /* If background wake capture was open, close RX cleanly before reconfiguring for full-duplex voice */
+    bsp_rec_close_locked();
+
+    /* Arbitrate with active music playback */
+    s_voice_resume_music = false;
+    if (s_audio_state == BSP_AUDIO_STATE_PLAYING) {
+        s_voice_resume_music = true;
+        audio_pause();
+        vTaskDelay(pdMS_TO_TICKS(60));
+    } else {
+        bsp_pa_en_set(0);
+    }
+
+    s_saved_rate = s_sample_rate ? s_sample_rate : 44100;
+    s_saved_ch = s_channels ? s_channels : 2;
+    s_saved_bits = s_bits_per_sample ? s_bits_per_sample : 16;
+
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = sample_rate_hz,
+        .channel = 2,
+        .bits_per_sample = 16,
+    };
+
+    esp_codec_dev_close(s_play_dev);
+    esp_err_t ret = esp_codec_dev_open(s_play_dev, &fs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Voice: reopen ES8311 at %lu Hz failed (%s)",
+                 (unsigned long)sample_rate_hz, esp_err_to_name(ret));
+        voice_unlock();
+        return ret;
+    }
+    s_cur_i2s_rate = sample_rate_hz;
+    bsp_es8311_ensure_dac_ready();
+
+    if (s_rec_dev) {
+        esp_err_t rret = esp_codec_dev_open(s_rec_dev, &fs);
+        if (rret == ESP_OK) {
+            s_rec_opened = true;
+            esp_codec_dev_set_in_gain(s_rec_dev, 30.0f);
+        } else {
+            ESP_LOGW(TAG, "Voice: open ES7210 RX at %lu Hz failed (%s)",
+                     (unsigned long)sample_rate_hz, esp_err_to_name(rret));
+        }
+    }
+
+    s_voice_active = true;
+    ESP_LOGI(TAG, "Voice session started (%lu Hz full-duplex, mic=%d, paused_music=%d)",
+             (unsigned long)sample_rate_hz, s_mic_available ? 1 : 0, s_voice_resume_music ? 1 : 0);
+    voice_unlock();
+    return ESP_OK;
+}
+
+void bsp_audio_voice_end(void)
+{
+    voice_lock();
+    if (!s_voice_active) {
+        voice_unlock();
+        return;
+    }
+
+    bsp_pa_en_set(0);
+    bsp_rec_close_locked();
+    if (s_play_dev) {
+        esp_codec_dev_close(s_play_dev);
+        esp_codec_dev_sample_info_t fs = {
+            .sample_rate = s_saved_rate,
+            .channel = (uint8_t)s_saved_ch,
+            .bits_per_sample = (uint8_t)s_saved_bits,
+        };
+        if (esp_codec_dev_open(s_play_dev, &fs) == ESP_OK) {
+            s_cur_i2s_rate = s_saved_rate;
+            bsp_es8311_ensure_dac_ready();
+        }
+    }
+
+    s_voice_active = false;
+    bool resume = s_voice_resume_music;
+    s_voice_resume_music = false;
+    ESP_LOGI(TAG, "Voice session ended (restored %lu Hz, resume_music=%d)",
+             (unsigned long)s_saved_rate, resume ? 1 : 0);
+    voice_unlock();
+    if (resume) {
+        audio_resume();
+    }
+}
+
+esp_err_t bsp_audio_voice_read(int16_t *mono_out, size_t samples, uint16_t *out_peak)
+{
+    if (!mono_out || samples == 0) {
+        if (out_peak) *out_peak = 0;
+        return ESP_ERR_INVALID_ARG;
+    }
+    voice_lock();
+    if (!s_voice_active || !s_rec_dev || !s_voice_io_buf) {
+        voice_unlock();
+        if (out_peak) *out_peak = 0;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t peak = 0;
+    size_t done = 0;
+    while (done < samples) {
+        size_t chunk = samples - done;
+        if (chunk > 960) chunk = 960;
+        size_t bytes = chunk * 2 * sizeof(int16_t);
+        esp_err_t ret = esp_codec_dev_read(s_rec_dev, s_voice_io_buf, (int)bytes);
+        if (ret != ESP_OK) {
+            voice_unlock();
+            if (out_peak) *out_peak = peak;
+            return ret;
+        }
+        for (size_t i = 0; i < chunk; i++) {
+            int32_t l = s_voice_io_buf[i * 2];
+            int32_t r = s_voice_io_buf[i * 2 + 1];
+            /* Sum L+R with saturation (+6dB when only one ES7210 channel is mic, e.g. SZP-S3 MIC2) */
+            int32_t sum = l + r;
+            if (sum > 32767) sum = 32767;
+            else if (sum < -32768) sum = -32768;
+            int16_t m = (int16_t)sum;
+            mono_out[done + i] = m;
+            uint16_t a = (uint16_t)(m < 0 ? -m : m);
+            if (a > peak) peak = a;
+        }
+        done += chunk;
+    }
+    voice_unlock();
+    if (out_peak) *out_peak = peak;
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_voice_write(const int16_t *mono_in, size_t samples)
+{
+    if (!mono_in || samples == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    voice_lock();
+    if (!s_voice_active || !s_play_dev || !s_voice_io_buf) {
+        voice_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t done = 0;
+    while (done < samples) {
+        size_t chunk = samples - done;
+        if (chunk > 960) chunk = 960;
+        for (size_t i = 0; i < chunk; i++) {
+            int16_t s = mono_in[done + i];
+            s_voice_io_buf[i * 2] = s;
+            s_voice_io_buf[i * 2 + 1] = s;
+        }
+        esp_err_t ret = esp_codec_dev_write(s_play_dev, s_voice_io_buf,
+                                            (int)(chunk * 2 * sizeof(int16_t)));
+        if (ret != ESP_OK) {
+            voice_unlock();
+            return ret;
+        }
+        done += chunk;
+    }
+    voice_unlock();
+    return ESP_OK;
+}
+
+void bsp_audio_voice_set_pa(bool on)
+{
+    if (on) {
+        voice_lock();
+        if (s_play_dev && s_voice_active) {
+            bsp_es8311_ensure_dac_ready();
+        }
+        voice_unlock();
+    }
+    bsp_pa_en_set(on ? 1 : 0);
+}
+
+void bsp_audio_voice_set_resume_music(bool resume)
+{
+    voice_lock();
+    s_voice_resume_music = resume;
+    voice_unlock();
+}
+
+bool bsp_audio_is_wake_active(void)
+{
+    return s_wake_active;
+}
+
+esp_err_t bsp_audio_wake_begin(void)
+{
+    if (!s_audio_initialized) {
+        ESP_RETURN_ON_ERROR(bsp_audio_init(), TAG, "Wake begin failed: audio not init");
+    }
+    voice_lock();
+    if (!s_mic_available || !s_rec_dev || !s_play_dev) {
+        voice_unlock();
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (s_voice_active) {
+        voice_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_wake_active) {
+        voice_unlock();
+        return ESP_OK;
+    }
+
+    bool music_playing = (s_audio_state == BSP_AUDIO_STATE_PLAYING);
+    bool in_music_guard = (esp_timer_get_time() - s_music_clk_guard_us) < 1500000LL;
+    uint32_t target_rate = (music_playing || in_music_guard)
+                               ? (s_cur_i2s_rate ? s_cur_i2s_rate : 44100)
+                               : 16000;
+
+    /* Ensure RX is closed before touching TX */
+    if (s_rec_opened) {
+        esp_codec_dev_close(s_rec_dev);
+        s_rec_opened = false;
+    }
+
+    if (!music_playing && !in_music_guard && s_cur_i2s_rate != 16000) {
+        /* Safe to set I2S1 to native 16kHz with PA strictly off (zero speaker noise) */
+        bsp_pa_en_set(0);
+        esp_codec_dev_sample_info_t fs_tx = {
+            .sample_rate = 16000,
+            .channel = 2,
+            .bits_per_sample = 16,
+        };
+        esp_codec_dev_close(s_play_dev);
+        esp_err_t tret = esp_codec_dev_open(s_play_dev, &fs_tx);
+        if (tret != ESP_OK) {
+            ESP_LOGW(TAG, "Wake: open ES8311 @ 16k failed (%s)", esp_err_to_name(tret));
+            voice_unlock();
+            return tret;
+        }
+        s_cur_i2s_rate = 16000;
+        bsp_es8311_ensure_dac_ready();
+        target_rate = 16000;
+    } else {
+        target_rate = s_cur_i2s_rate ? s_cur_i2s_rate : 16000;
+    }
+
+    esp_codec_dev_sample_info_t fs_rx = {
+        .sample_rate = target_rate,
+        .channel = 2,
+        .bits_per_sample = 16,
+    };
+    esp_err_t rret = esp_codec_dev_open(s_rec_dev, &fs_rx);
+    if (rret != ESP_OK) {
+        ESP_LOGW(TAG, "Wake: open ES7210 RX @ %lu Hz failed (%s)",
+                 (unsigned long)target_rate, esp_err_to_name(rret));
+        voice_unlock();
+        return rret;
+    }
+    s_rec_opened = true;
+    esp_codec_dev_set_in_gain(s_rec_dev, 30.0f);
+    s_wake_hw_rate = target_rate;
+    s_wake_active = true;
+    ESP_LOGI(TAG, "Background wake capture started (%lu Hz, music=%d)",
+             (unsigned long)target_rate, music_playing ? 1 : 0);
+    voice_unlock();
+    return ESP_OK;
+}
+
+void bsp_audio_wake_end(void)
+{
+    voice_lock();
+    if (!s_wake_active && !s_rec_opened) {
+        voice_unlock();
+        return;
+    }
+    bsp_rec_close_locked();
+    ESP_LOGI(TAG, "Background wake capture stopped");
+    voice_unlock();
+}
+
+esp_err_t bsp_audio_wake_read_16k(int16_t *mono_16k_out, size_t samples_16k)
+{
+    if (!mono_16k_out || samples_16k == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    voice_lock();
+    if (!s_wake_active || s_voice_active || !s_rec_dev || !s_rec_opened) {
+        voice_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Only drop back to native 16kHz when music has been fully STOPPED for >2.0s */
+    if (s_audio_state == BSP_AUDIO_STATE_STOPPED && s_wake_hw_rate != 16000 &&
+        (esp_timer_get_time() - s_music_clk_guard_us > 2000000LL)) {
+        bsp_rec_close_locked();
+        bsp_pa_en_set(0);
+        esp_codec_dev_sample_info_t fs16 = {
+            .sample_rate = 16000,
+            .channel = 2,
+            .bits_per_sample = 16,
+        };
+        esp_codec_dev_close(s_play_dev);
+        if (esp_codec_dev_open(s_play_dev, &fs16) == ESP_OK) {
+            s_cur_i2s_rate = 16000;
+            bsp_es8311_ensure_dac_ready();
+        }
+        if (esp_codec_dev_open(s_rec_dev, &fs16) == ESP_OK) {
+            s_rec_opened = true;
+            s_wake_active = true;
+            esp_codec_dev_set_in_gain(s_rec_dev, 30.0f);
+            s_wake_hw_rate = 16000;
+            ESP_LOGI(TAG, "Wake RX returned to native 16000 Hz");
+        } else {
+            s_wake_active = false;
+            voice_unlock();
+            return ESP_FAIL;
+        }
+    }
+
+    uint32_t hw_rate = s_wake_hw_rate ? s_wake_hw_rate : 16000;
+    size_t hw_frames = (hw_rate == 16000)
+                           ? samples_16k
+                           : (size_t)(((uint64_t)samples_16k * (uint64_t)hw_rate + 8000ULL) / 16000ULL);
+    if (hw_frames < 1) hw_frames = 1;
+
+    if (hw_frames > s_wake_rx_cap_frames) {
+        int16_t *nb = (int16_t *)heap_caps_realloc(
+            s_wake_rx_buf, hw_frames * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!nb) {
+            nb = (int16_t *)realloc(s_wake_rx_buf, hw_frames * 2 * sizeof(int16_t));
+        }
+        if (!nb) {
+            voice_unlock();
+            return ESP_ERR_NO_MEM;
+        }
+        s_wake_rx_buf = nb;
+        s_wake_rx_cap_frames = hw_frames;
+    }
+
+    esp_err_t ret = esp_codec_dev_read(s_rec_dev, s_wake_rx_buf, (int)(hw_frames * 2 * sizeof(int16_t)));
+    if (ret != ESP_OK) {
+        voice_unlock();
+        return ret;
+    }
+
+    if (hw_rate == 16000) {
+        for (size_t i = 0; i < samples_16k; i++) {
+            int32_t sum = (int32_t)s_wake_rx_buf[i * 2] + (int32_t)s_wake_rx_buf[i * 2 + 1];
+            if (sum > 32767) sum = 32767;
+            else if (sum < -32768) sum = -32768;
+            mono_16k_out[i] = (int16_t)sum;
+        }
+    } else {
+        if (hw_frames > s_wake_mono_cap) {
+            int16_t *nm = (int16_t *)heap_caps_realloc(
+                s_wake_mono_buf, hw_frames * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!nm) {
+                nm = (int16_t *)realloc(s_wake_mono_buf, hw_frames * sizeof(int16_t));
+            }
+            if (!nm) {
+                voice_unlock();
+                return ESP_ERR_NO_MEM;
+            }
+            s_wake_mono_buf = nm;
+            s_wake_mono_cap = hw_frames;
+        }
+        for (size_t i = 0; i < hw_frames; i++) {
+            int32_t sum = (int32_t)s_wake_rx_buf[i * 2] + (int32_t)s_wake_rx_buf[i * 2 + 1];
+            if (sum > 32767) sum = 32767;
+            else if (sum < -32768) sum = -32768;
+            s_wake_mono_buf[i] = (int16_t)sum;
+        }
+        /* Fixed-point Q16 linear resampling from hw_rate -> 16000 Hz */
+        uint32_t step_q16 = (uint32_t)(((uint64_t)hw_frames << 16) / (uint64_t)samples_16k);
+        uint32_t pos_q16 = 0;
+        for (size_t i = 0; i < samples_16k; i++) {
+            size_t idx = (size_t)(pos_q16 >> 16);
+            uint32_t frac = pos_q16 & 0xFFFFU;
+            if (idx >= hw_frames - 1) {
+                mono_16k_out[i] = s_wake_mono_buf[hw_frames - 1];
+            } else {
+                int32_t a = s_wake_mono_buf[idx];
+                int32_t b = s_wake_mono_buf[idx + 1];
+                mono_16k_out[i] = (int16_t)(a + (((b - a) * (int32_t)frac) >> 16));
+            }
+            pos_q16 += step_q16;
+        }
+    }
+
+    voice_unlock();
+    if (hw_rate != 16000) {
+        /* Brief yield during 44.1kHz music playback so Audio Task / LVGL never starve */
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return ESP_OK;
+}
+
+void bsp_audio_get_diag_json(char *out_json, size_t max_len)
+{
+    if (!out_json || max_len < 64) return;
+    uint8_t pca[4] = {0};
+    esp_err_t pca_err = bsp_pca9557_read_hw_regs(pca);
+    uint8_t pca_cached = 0;
+    bsp_pca9557_get_output_state(&pca_cached);
+
+    int r00 = -1, r01 = -1, r02 = -1, r05 = -1, r06 = -1, r09 = -1;
+    int r0d = -1, r0e = -1, r10 = -1, r11 = -1, r12 = -1, r13 = -1, r14 = -1;
+    int r31 = -1, r32 = -1, r37 = -1, r44 = -1, rfd = -1, rfe = -1;
+    if (s_play_dev) {
+        voice_lock();
+        esp_codec_dev_read_reg(s_play_dev, 0x00, &r00);
+        esp_codec_dev_read_reg(s_play_dev, 0x01, &r01);
+        esp_codec_dev_read_reg(s_play_dev, 0x02, &r02);
+        esp_codec_dev_read_reg(s_play_dev, 0x05, &r05);
+        esp_codec_dev_read_reg(s_play_dev, 0x06, &r06);
+        esp_codec_dev_read_reg(s_play_dev, 0x09, &r09);
+        esp_codec_dev_read_reg(s_play_dev, 0x0D, &r0d);
+        esp_codec_dev_read_reg(s_play_dev, 0x0E, &r0e);
+        esp_codec_dev_read_reg(s_play_dev, 0x10, &r10);
+        esp_codec_dev_read_reg(s_play_dev, 0x11, &r11);
+        esp_codec_dev_read_reg(s_play_dev, 0x12, &r12);
+        esp_codec_dev_read_reg(s_play_dev, 0x13, &r13);
+        esp_codec_dev_read_reg(s_play_dev, 0x14, &r14);
+        esp_codec_dev_read_reg(s_play_dev, 0x31, &r31);
+        esp_codec_dev_read_reg(s_play_dev, 0x32, &r32);
+        esp_codec_dev_read_reg(s_play_dev, 0x37, &r37);
+        esp_codec_dev_read_reg(s_play_dev, 0x44, &r44);
+        esp_codec_dev_read_reg(s_play_dev, 0xFD, &rfd);
+        esp_codec_dev_read_reg(s_play_dev, 0xFE, &rfe);
+        voice_unlock();
+    }
+
+    uint32_t i2s_tx_conf = I2S1.tx_conf.val;
+    uint32_t i2s_rx_conf = I2S1.rx_conf.val;
+    uint32_t i2s_tx_clkm = I2S1.tx_clkm_conf.val;
+    uint32_t i2s_rx_clkm = I2S1.rx_clkm_conf.val;
+    uint32_t gpio45_out = GPIO.func_out_sel_cfg[45].val;
+    uint32_t gpio38_out = GPIO.func_out_sel_cfg[38].val;
+    uint32_t gpio14_out = GPIO.func_out_sel_cfg[14].val;
+    uint32_t gpio13_out = GPIO.func_out_sel_cfg[13].val;
+
+    snprintf(out_json, max_len,
+             "{\"state\":%d,\"vol\":%u,\"sr\":%lu,\"cur_i2s_sr\":%lu,\"wake\":%d,\"voice\":%d,\"rec_open\":%d,"
+             "\"pcm_written\":%llu,\"last_werr\":%d,\"last_peak\":%u,"
+             "\"pca_err\":%d,\"pca_cached\":\"0x%02X\",\"pca_hw\":[\"0x%02X\",\"0x%02X\",\"0x%02X\",\"0x%02X\"],"
+             "\"es8311\":{\"00\":\"%02X\",\"01\":\"%02X\",\"02\":\"%02X\",\"05\":\"%02X\",\"06\":\"%02X\",\"09\":\"%02X\","
+             "\"0D\":\"%02X\",\"0E\":\"%02X\",\"10\":\"%02X\",\"11\":\"%02X\",\"12\":\"%02X\",\"13\":\"%02X\",\"14\":\"%02X\","
+             "\"31\":\"%02X\",\"32\":\"%02X\",\"37\":\"%02X\",\"44\":\"%02X\",\"FD\":\"%02X\",\"FE\":\"%02X\"},"
+             "\"i2s1\":{\"tx_conf\":\"0x%08lX\",\"rx_conf\":\"0x%08lX\",\"tx_clkm\":\"0x%08lX\",\"rx_clkm\":\"0x%08lX\"},"
+             "\"gpio_out\":{\"45\":\"0x%04lX\",\"38\":\"0x%04lX\",\"14\":\"0x%04lX\",\"13\":\"0x%04lX\"}}",
+             (int)s_audio_state, (unsigned)s_volume, (unsigned long)s_sample_rate, (unsigned long)s_cur_i2s_rate,
+             s_wake_active ? 1 : 0, s_voice_active ? 1 : 0, s_rec_opened ? 1 : 0,
+             (unsigned long long)s_total_pcm_written, (int)s_last_write_err, (unsigned)s_last_music_peak,
+             (int)pca_err, pca_cached, pca[0], pca[1], pca[2], pca[3],
+             r00 & 0xFF, r01 & 0xFF, r02 & 0xFF, r05 & 0xFF, r06 & 0xFF, r09 & 0xFF,
+             r0d & 0xFF, r0e & 0xFF, r10 & 0xFF, r11 & 0xFF, r12 & 0xFF, r13 & 0xFF, r14 & 0xFF,
+             r31 & 0xFF, r32 & 0xFF, r37 & 0xFF, r44 & 0xFF, rfd & 0xFF, rfe & 0xFF,
+             (unsigned long)i2s_tx_conf, (unsigned long)i2s_rx_conf,
+             (unsigned long)i2s_tx_clkm, (unsigned long)i2s_rx_clkm,
+             (unsigned long)(gpio45_out & 0xFFFF), (unsigned long)(gpio38_out & 0xFFFF),
+             (unsigned long)(gpio14_out & 0xFFFF), (unsigned long)(gpio13_out & 0xFFFF));
+}
+
+esp_err_t bsp_audio_test_beep(uint32_t duration_ms)
+{
+    if (!s_audio_initialized || !s_play_dev) return ESP_ERR_INVALID_STATE;
+    if (duration_ms < 100) duration_ms = 100;
+    if (duration_ms > 2000) duration_ms = 2000;
+
+    voice_lock();
+    if (s_voice_active || s_audio_state == BSP_AUDIO_STATE_PLAYING) {
+        voice_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    bsp_rec_close_locked();
+    uint32_t rate = s_cur_i2s_rate ? s_cur_i2s_rate : 16000;
+    bsp_es8311_ensure_dac_ready();
+    bsp_pa_en_set(1);
+
+    int16_t buf[256 * 2];
+    uint32_t total_frames = (rate * duration_ms) / 1000U;
+    uint32_t done = 0;
+    esp_err_t ret = ESP_OK;
+    while (done < total_frames) {
+        uint32_t n = total_frames - done;
+        if (n > 256) n = 256;
+        for (uint32_t i = 0; i < n; i++) {
+            float t = (float)(done + i) / (float)rate;
+            int16_t s = (int16_t)(12000.0f * sinf(2.0f * 3.14159265f * 660.0f * t));
+            buf[i * 2] = s;
+            buf[i * 2 + 1] = s;
+        }
+        ret = esp_codec_dev_write(s_play_dev, buf, (int)(n * 2 * sizeof(int16_t)));
+        if (ret != ESP_OK) break;
+        done += n;
+    }
+    memset(buf, 0, sizeof(buf));
+    esp_codec_dev_write(s_play_dev, buf, sizeof(buf));
+    bsp_pa_en_set(0);
+    voice_unlock();
+    return ret;
 }
 

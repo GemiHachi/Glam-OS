@@ -29,19 +29,19 @@ extern "C" {
 #define UI_RIGHT_TOP_HEIGHT       152
 #define UI_RIGHT_BOT_HEIGHT       88
 
-/* Exact Color Palette from iSwift Radio (Color.kt) */
-#define UI_COLOR_HEX_BG             0x000000  /* BackgroundDark */
-#define UI_COLOR_HEX_SURFACE        0x121212  /* SurfaceContainer / BackgroundSecondary */
-#define UI_COLOR_HEX_SURFACE_HIGH   0x181818  /* CardBg / SurfaceContainerHigh */
-#define UI_COLOR_HEX_SURFACE_HOVER  0x242424  /* SurfaceContainerHighest */
-#define UI_COLOR_HEX_BORDER         0x2A2A2A  /* BorderColor / Separator */
-#define UI_COLOR_HEX_ACCENT         0xE60012  /* Pantone 186C Accent Red */
-#define UI_COLOR_HEX_ACCENT_ALT     0xC8102E  /* iSwift PrimaryColor */
-#define UI_COLOR_HEX_ACCENT_GLOW    0x4A050A  /* Accent Glow / Dimmed */
-#define UI_COLOR_HEX_TEXT_PRIMARY   0xFFFFFF  /* TextPrimary */
-#define UI_COLOR_HEX_TEXT_SECONDARY 0xB3B3B3  /* TextSecondary */
-#define UI_COLOR_HEX_TEXT_TERTIARY  0x7A7A7A  /* TextTertiary */
-#define UI_COLOR_HEX_BAR_BG         0x2A2A2A  /* Progress Track */
+/* Modern Dark-Glass Music Palette (V3.0) */
+#define UI_COLOR_HEX_BG             0x0B0E17  /* Deep Midnight Base */
+#define UI_COLOR_HEX_SURFACE        0x151A28  /* Glass Surface */
+#define UI_COLOR_HEX_SURFACE_HIGH   0x1E2538  /* Elevated Glass Card */
+#define UI_COLOR_HEX_SURFACE_HOVER  0x28314A  /* Active / Pressed Surface */
+#define UI_COLOR_HEX_BORDER         0x2E3852  /* Subtle Glass Border */
+#define UI_COLOR_HEX_ACCENT         0xFF2D55  /* Vibrant Rose Red */
+#define UI_COLOR_HEX_ACCENT_ALT     0xE11D48  /* Secondary Rose */
+#define UI_COLOR_HEX_ACCENT_GLOW    0x3B1222  /* Accent Glow / Dimmed */
+#define UI_COLOR_HEX_TEXT_PRIMARY   0xF8FAFC  /* TextPrimary */
+#define UI_COLOR_HEX_TEXT_SECONDARY 0x94A3B8  /* TextSecondary */
+#define UI_COLOR_HEX_TEXT_TERTIARY  0x64748B  /* TextTertiary */
+#define UI_COLOR_HEX_BAR_BG         0x2E3852  /* Progress Track */
 #define UI_COLOR_HEX_STATUS_DOCK    0x34C759  /* Connected Green */
 #define UI_COLOR_HEX_STATUS_SD      0xFFA000  /* SD Amber */
 
@@ -51,6 +51,7 @@ extern "C" {
 #define UI_COLOR_SURFACE_HIGH   lv_color_hex(UI_COLOR_HEX_SURFACE_HIGH)
 #define UI_COLOR_BORDER         lv_color_hex(UI_COLOR_HEX_BORDER)
 #define UI_COLOR_ACCENT         lv_color_hex(UI_COLOR_HEX_ACCENT)
+#define UI_COLOR_ACCENT_ALT     lv_color_hex(UI_COLOR_HEX_ACCENT_ALT)
 #define UI_COLOR_ACCENT_GLOW    lv_color_hex(UI_COLOR_HEX_ACCENT_GLOW)
 #define UI_COLOR_TEXT_PRIMARY   lv_color_hex(UI_COLOR_HEX_TEXT_PRIMARY)
 #define UI_COLOR_TEXT_SECONDARY lv_color_hex(UI_COLOR_HEX_TEXT_SECONDARY)

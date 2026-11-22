@@ -10,6 +10,7 @@ idf_component_register(
         "include"
     REQUIRES
         driver
+        esp_timer
         esp_hw_support
         esp_lcd
         fatfs

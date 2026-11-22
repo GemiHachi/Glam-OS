@@ -226,11 +226,12 @@ static void kbd24_refresh_ime_ui_locked(void)
                 lv_obj_t *cbtn = lv_btn_create(s_kbd24_cand_row);
                 lv_obj_set_height(cbtn, 24);
                 lv_obj_set_style_bg_color(cbtn, lv_color_hex((i == 0) ? s_th.accent_tint : s_th.surface_high), 0);
+                lv_obj_set_style_bg_color(cbtn, lv_color_hex(s_th.accent), LV_STATE_PRESSED);
                 lv_obj_set_style_border_color(cbtn, lv_color_hex((i == 0) ? s_th.accent : s_th.border), 0);
                 lv_obj_set_style_border_width(cbtn, 1, 0);
-                lv_obj_set_style_radius(cbtn, 5, 0);
+                lv_obj_set_style_radius(cbtn, 10, 0);
                 lv_obj_set_style_shadow_width(cbtn, 0, 0);
-                lv_obj_set_style_pad_hor(cbtn, 8, 0);
+                lv_obj_set_style_pad_hor(cbtn, 9, 0);
                 lv_obj_set_style_pad_ver(cbtn, 0, 0);
                 lv_obj_add_event_cb(cbtn, kbd24_cand_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
@@ -285,6 +286,8 @@ static void kbd24_refresh_keys_locked(void)
         lv_obj_set_style_bg_color(s_kbd24_btns[idx],
                                   lv_color_hex(is_accent ? s_th.accent :
                                                (is_ctrl ? s_th.surface_high : s_th.surface)), 0);
+        lv_obj_set_style_bg_color(s_kbd24_btns[idx],
+                                  lv_color_hex(is_accent ? s_th.accent_tint : s_th.accent_tint), LV_STATE_PRESSED);
         lv_obj_set_style_border_color(s_kbd24_btns[idx],
                                       lv_color_hex(is_accent ? s_th.accent : s_th.border), 0);
         lv_obj_set_style_text_color(s_kbd24_lbls[idx],
@@ -426,7 +429,7 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     s_kbd24_modal = lv_obj_create(parent);
     lv_obj_set_pos(s_kbd24_modal, 0, 0);
     lv_obj_set_size(s_kbd24_modal, KBD24_SCREEN_W, KBD24_SCREEN_H);
-    lv_obj_set_style_bg_opa(s_kbd24_modal, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(s_kbd24_modal, LV_OPA_90, 0);
     lv_obj_set_style_border_width(s_kbd24_modal, 0, 0);
     lv_obj_set_style_radius(s_kbd24_modal, 0, 0);
     lv_obj_set_style_pad_all(s_kbd24_modal, 0, 0);
@@ -437,9 +440,10 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     lv_obj_set_pos(s_kbd24_btn_cancel, 2, 1);
     lv_obj_set_size(s_kbd24_btn_cancel, 42, 26);
     lv_obj_set_style_border_width(s_kbd24_btn_cancel, 1, 0);
-    lv_obj_set_style_radius(s_kbd24_btn_cancel, 5, 0);
+    lv_obj_set_style_radius(s_kbd24_btn_cancel, 8, 0);
     lv_obj_set_style_shadow_width(s_kbd24_btn_cancel, 0, 0);
     lv_obj_set_style_pad_all(s_kbd24_btn_cancel, 0, 0);
+    lv_obj_set_style_translate_y(s_kbd24_btn_cancel, 1, LV_STATE_PRESSED);
     lv_obj_add_event_cb(s_kbd24_btn_cancel, kbd24_cancel_cb, LV_EVENT_CLICKED, NULL);
     s_kbd24_lbl_cancel = lv_label_create(s_kbd24_btn_cancel);
     lv_obj_center(s_kbd24_lbl_cancel);
@@ -449,15 +453,15 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     s_kbd24_preview_box = lv_obj_create(s_kbd24_modal);
     lv_obj_set_pos(s_kbd24_preview_box, 46, 1);
     lv_obj_set_size(s_kbd24_preview_box, 182, 26);
-    lv_obj_set_style_bg_opa(s_kbd24_preview_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(s_kbd24_preview_box, LV_OPA_90, 0);
     lv_obj_set_style_border_width(s_kbd24_preview_box, 1, 0);
-    lv_obj_set_style_radius(s_kbd24_preview_box, 5, 0);
+    lv_obj_set_style_radius(s_kbd24_preview_box, 8, 0);
     lv_obj_set_style_pad_all(s_kbd24_preview_box, 0, 0);
     lv_obj_clear_flag(s_kbd24_preview_box, LV_OBJ_FLAG_SCROLLABLE);
 
     s_kbd24_preview_lbl = lv_label_create(s_kbd24_preview_box);
     lv_obj_set_width(s_kbd24_preview_lbl, 172);
-    lv_obj_align(s_kbd24_preview_lbl, LV_ALIGN_LEFT_MID, 5, 0);
+    lv_obj_align(s_kbd24_preview_lbl, LV_ALIGN_LEFT_MID, 6, 0);
     lv_label_set_text(s_kbd24_preview_lbl, "输入: _");
     lv_label_set_long_mode(s_kbd24_preview_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_font(s_kbd24_preview_lbl, &ui_font_cjk_14, 0);
@@ -466,9 +470,10 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     lv_obj_set_pos(s_kbd24_btn_ime, 230, 1);
     lv_obj_set_size(s_kbd24_btn_ime, 44, 26);
     lv_obj_set_style_border_width(s_kbd24_btn_ime, 1, 0);
-    lv_obj_set_style_radius(s_kbd24_btn_ime, 5, 0);
+    lv_obj_set_style_radius(s_kbd24_btn_ime, 8, 0);
     lv_obj_set_style_shadow_width(s_kbd24_btn_ime, 0, 0);
     lv_obj_set_style_pad_all(s_kbd24_btn_ime, 0, 0);
+    lv_obj_set_style_translate_y(s_kbd24_btn_ime, 1, LV_STATE_PRESSED);
     lv_obj_add_event_cb(s_kbd24_btn_ime, kbd24_ime_toggle_cb, LV_EVENT_CLICKED, NULL);
     s_kbd24_lbl_ime = lv_label_create(s_kbd24_btn_ime);
     lv_obj_center(s_kbd24_lbl_ime);
@@ -479,9 +484,10 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     lv_obj_set_pos(s_kbd24_btn_clear, 276, 1);
     lv_obj_set_size(s_kbd24_btn_clear, 42, 26);
     lv_obj_set_style_border_width(s_kbd24_btn_clear, 1, 0);
-    lv_obj_set_style_radius(s_kbd24_btn_clear, 5, 0);
+    lv_obj_set_style_radius(s_kbd24_btn_clear, 8, 0);
     lv_obj_set_style_shadow_width(s_kbd24_btn_clear, 0, 0);
     lv_obj_set_style_pad_all(s_kbd24_btn_clear, 0, 0);
+    lv_obj_set_style_translate_y(s_kbd24_btn_clear, 1, LV_STATE_PRESSED);
     lv_obj_add_event_cb(s_kbd24_btn_clear, kbd24_clear_cb, LV_EVENT_CLICKED, NULL);
     s_kbd24_lbl_clear = lv_label_create(s_kbd24_btn_clear);
     lv_obj_center(s_kbd24_lbl_clear);
@@ -492,9 +498,9 @@ void os_kbd24_init_locked(lv_obj_t *parent)
     s_kbd24_py_box = lv_obj_create(s_kbd24_modal);
     lv_obj_set_pos(s_kbd24_py_box, 2, 29);
     lv_obj_set_size(s_kbd24_py_box, 68, 26);
-    lv_obj_set_style_bg_opa(s_kbd24_py_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(s_kbd24_py_box, LV_OPA_90, 0);
     lv_obj_set_style_border_width(s_kbd24_py_box, 1, 0);
-    lv_obj_set_style_radius(s_kbd24_py_box, 5, 0);
+    lv_obj_set_style_radius(s_kbd24_py_box, 8, 0);
     lv_obj_set_style_pad_all(s_kbd24_py_box, 0, 0);
     lv_obj_clear_flag(s_kbd24_py_box, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -528,8 +534,12 @@ void os_kbd24_init_locked(lv_obj_t *parent)
         lv_obj_t *btn = lv_btn_create(s_kbd24_modal);
         lv_obj_set_pos(btn, x, y);
         lv_obj_set_size(btn, 51, 43);
-        lv_obj_set_style_border_width(btn, 1, 0);
-        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_90, 0);
+        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_set_style_border_side(btn, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_translate_y(btn, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_radius(btn, 8, 0);
         lv_obj_set_style_shadow_width(btn, 0, 0);
         lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_add_event_cb(btn, kbd24_key_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
@@ -587,6 +597,11 @@ void os_kbd24_apply_theme_locked(const os_kbd24_theme_t *theme)
     kbd24_refresh_ime_ui_locked();
 }
 
+static void kbd24_anim_y_cb(void *var, int32_t v)
+{
+    lv_obj_set_y((lv_obj_t *)var, (lv_coord_t)v);
+}
+
 void os_kbd24_open_locked(lv_obj_t *target_ta, const char *prompt, int start_page,
                           bool default_zh, os_kbd24_done_cb_t done_cb, void *user_data)
 {
@@ -616,13 +631,25 @@ void os_kbd24_open_locked(lv_obj_t *target_ta, const char *prompt, int start_pag
     kbd24_refresh_keys_locked();
     kbd24_update_preview_locked();
     kbd24_refresh_ime_ui_locked();
+    lv_anim_del(s_kbd24_modal, NULL);
     lv_obj_clear_flag(s_kbd24_modal, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_kbd24_modal);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_kbd24_modal);
+    lv_anim_set_exec_cb(&a, kbd24_anim_y_cb);
+    lv_anim_set_values(&a, 60, 0);
+    lv_anim_set_time(&a, 180);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
 }
 
 void os_kbd24_close_locked(void)
 {
     if (s_kbd24_modal) {
+        lv_anim_del(s_kbd24_modal, NULL);
+        lv_obj_set_y(s_kbd24_modal, 0);
         lv_obj_add_flag(s_kbd24_modal, LV_OBJ_FLAG_HIDDEN);
     }
 }

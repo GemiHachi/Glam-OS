@@ -96,6 +96,18 @@ esp_err_t cover_decode_jpeg_fit(const uint8_t *jpg_buf, size_t jpg_len,
                                 int max_w, int max_h,
                                 lv_img_dsc_t *out_dsc, lv_color_t **out_fb);
 
+/**
+ * @brief Apply fast 4-pass separable Gaussian blur + brightness scrim + Bayer-dithered
+ *        upscale from any source RGB565 buffer (src_w x src_h) into a 320x240 RGB565 destination buffer.
+ * @param src_fb            Source RGB565 buffer
+ * @param src_w             Source width
+ * @param src_h             Source height
+ * @param dst_bg            Destination 320x240 RGB565 buffer
+ * @param brightness_scale  0..256 multiplier (e.g. 105 for dark glass scrim, 210 for light frost)
+ */
+void cover_generate_blurred_bg(const lv_color_t *src_fb, int src_w, int src_h,
+                               lv_color_t *dst_bg, int brightness_scale);
+
 #ifdef __cplusplus
 }
 #endif

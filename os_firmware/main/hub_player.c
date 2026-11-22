@@ -728,6 +728,71 @@ static void on_ui_volume_changed(int volume_pct)
 /* ========================================================================= */
 
 static bool s_hub_initialized = false;
+static char s_now_title[96] = "G'lam 音乐";
+static char s_now_artist[64] = "点击开启音乐之旅";
+
+static void set_now_playing_meta(const char *title, const char *artist)
+{
+    if (title && title[0]) {
+        snprintf(s_now_title, sizeof(s_now_title), "%s", title);
+    }
+    if (artist && artist[0]) {
+        snprintf(s_now_artist, sizeof(s_now_artist), "%s", artist);
+    }
+}
+
+void hub_player_get_now_playing(char *out_title, size_t title_len,
+                                char *out_artist, size_t artist_len,
+                                uint32_t *out_cur_ms, uint32_t *out_tot_ms,
+                                bool *out_is_playing)
+{
+    bool playing = audio_is_playing();
+    bool paused = (audio_get_state() == BSP_AUDIO_STATE_PAUSED);
+    if (out_is_playing) *out_is_playing = playing;
+
+    uint32_t cur = 0, tot = 0;
+    if (playing || paused) {
+        audio_get_progress(&cur, &tot);
+    }
+    if (out_cur_ms) *out_cur_ms = cur;
+    if (out_tot_ms) *out_tot_ms = tot;
+
+    const char *cur_file = audio_get_current_file();
+    if ((!s_hub_initialized || (!s_has_current_online && !s_current_sd_path[0])) &&
+        (playing || paused) && cur_file && cur_file[0]) {
+        const char *fn = strrchr(cur_file, '/');
+        fn = fn ? (fn + 1) : cur_file;
+        char tbuf[96];
+        snprintf(tbuf, sizeof(tbuf), "%s", fn);
+        char *dot = strrchr(tbuf, '.');
+        if (dot) *dot = '\0';
+        if (out_title && title_len > 0) snprintf(out_title, title_len, "%s", tbuf);
+        if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s", "本地音频");
+        return;
+    }
+
+    if (out_title && title_len > 0) snprintf(out_title, title_len, "%s", s_now_title);
+    if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s", s_now_artist);
+}
+
+void hub_player_trigger_action(int ui_action_id)
+{
+    if (!s_hub_initialized) {
+        if (ui_action_id == UI_ACTION_PLAY_PAUSE) {
+            if (audio_is_playing()) {
+                audio_pause();
+            } else if (audio_get_state() == BSP_AUDIO_STATE_PAUSED) {
+                audio_resume();
+            } else {
+                os_ui_request_music_cmd("");
+            }
+        } else {
+            os_ui_request_music_cmd("");
+        }
+        return;
+    }
+    on_ui_action_received(ui_action_id);
+}
 
 void hub_player_notify_wifi(bool connected, const char *ssid, const char *ip, const char *reason)
 {
@@ -779,7 +844,10 @@ void hub_player_start_or_show(void)
         refresh_local_ui();
         refresh_fav_ui();
 
-        xTaskCreatePinnedToCore(online_worker_task, "online_worker", 10240, NULL, 4, NULL, 0);
+        if (xTaskCreatePinnedToCore(online_worker_task, "online_worker", 12288, NULL, 4, NULL, 0) != pdPASS) {
+            ESP_LOGE(TAG, "CRITICAL: online_worker_task create failed (free SRAM=%uB)!",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
         xTaskCreatePinnedToCoreWithCaps(standalone_progress_task, "sd_progress_task", 3072, NULL, 2, NULL, 1,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
@@ -1097,6 +1165,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
     lrc_parser_clear();
     s_last_lrc_idx = -1;
 
+    set_now_playing_meta(song.name, song.artist);
     ui_update_meta(song.name, song.artist, false);
     ui_set_mode_indicator(2, song.server[0] ? song.server : "ONLINE");
     ui_update_progress(0, 0);
@@ -1465,6 +1534,7 @@ static void play_sd_track_sync(int index, const char *override_path)
     hub_protocol_set_mode(HUB_MODE_STANDALONE);
     lrc_parser_clear();
 
+    set_now_playing_meta(title_buf, "本地音乐 SD");
     ui_update_meta(title_buf, "本地音乐 SD", false);
     ui_set_mode_indicator(1, "SD");
     ui_update_lyrics(NULL);
@@ -1623,6 +1693,7 @@ static void on_mode_changed(hub_mode_t new_mode)
 
         hub_track_info_t track;
         hub_protocol_get_current_track(&track);
+        set_now_playing_meta(track.title, track.artist);
         ui_update_meta(track.title, track.artist, true);
         ui_update_play_state(track.is_playing);
 

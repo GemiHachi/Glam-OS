@@ -162,6 +162,25 @@ void ui_init(void)
 /*                          View Switching & Updates                         */
 /* ========================================================================= */
 
+static void anim_obj_y_cb(void *var, int32_t v)
+{
+    lv_obj_set_y((lv_obj_t *)var, (lv_coord_t)v);
+}
+
+static void anim_slide_in_view(lv_obj_t *view)
+{
+    if (!view) return;
+    lv_anim_del(view, NULL);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, view);
+    lv_anim_set_exec_cb(&a, anim_obj_y_cb);
+    lv_anim_set_values(&a, 24, 0);
+    lv_anim_set_time(&a, 180);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
 void ui_show_music_app(bool show_player)
 {
     UI_LOCK();
@@ -170,10 +189,12 @@ void ui_show_music_app(bool show_player)
         if (s_home_view) lv_obj_add_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_player_view);
+        anim_slide_in_view(s_player_view);
     } else if (s_home_view) {
         if (s_player_view) lv_obj_add_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_home_view);
+        anim_slide_in_view(s_home_view);
     }
     UI_UNLOCK();
 }
@@ -182,8 +203,14 @@ void ui_hide_all(void)
 {
     UI_LOCK();
     os_kbd24_close_locked();
-    if (s_player_view) lv_obj_add_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
-    if (s_home_view) lv_obj_add_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
+    if (s_player_view) {
+        lv_anim_del(s_player_view, NULL);
+        lv_obj_add_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_home_view) {
+        lv_anim_del(s_home_view, NULL);
+        lv_obj_add_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
+    }
     UI_UNLOCK();
 }
 
@@ -195,9 +222,11 @@ void ui_show_player_view(bool show)
         if (show) {
             lv_obj_clear_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
+            anim_slide_in_view(s_player_view);
         } else {
             lv_obj_add_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(s_home_view, LV_OBJ_FLAG_HIDDEN);
+            anim_slide_in_view(s_home_view);
         }
     }
     UI_UNLOCK();
@@ -368,7 +397,7 @@ void ui_set_active_lyric_index(int index)
         lv_obj_set_style_text_color(s_lrc_item_lbls[index], UI_COLOR_TEXT_PRI, 0);
         if ((int32_t)(lv_tick_get() - s_lrc_user_scroll_until) > 0) {
             s_lrc_prog_scroll = true;
-            lv_obj_scroll_to_view(s_lrc_item_lbls[index], LV_ANIM_OFF);
+            lv_obj_scroll_to_view(s_lrc_item_lbls[index], LV_ANIM_ON);
             s_lrc_prog_scroll = false;
         }
     }
@@ -529,41 +558,45 @@ static void add_song_row(lv_obj_t *list, int idx, const char *text,
 {
     lv_obj_t *row = lv_obj_create(list);
     lv_obj_set_width(row, 304);
-    lv_obj_set_height(row, 30);
+    lv_obj_set_height(row, 32);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Main playable track button */
+    /* Main playable track pill card */
     lv_obj_t *btn = lv_btn_create(row);
     lv_obj_set_pos(btn, 0, 0);
-    lv_obj_set_size(btn, 254, 28);
+    lv_obj_set_size(btn, 252, 30);
     lv_obj_set_style_bg_color(btn, active ? UI_COLOR_ACCENT_GLOW : UI_COLOR_SURFACE, 0);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_SURFACE_HIGH, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_90, 0);
     lv_obj_set_style_border_color(btn, active ? UI_COLOR_ACCENT : UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(btn, 1, 0);
-    lv_obj_set_style_radius(btn, 5, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_set_style_pad_hor(btn, 6, 0);
+    lv_obj_set_style_translate_y(btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_pad_hor(btn, 8, 0);
     lv_obj_add_event_cb(btn, main_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(lbl, 240);
+    lv_obj_set_width(lbl, 236);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(lbl, UI_FONT_CJK, 0);
 
-    /* Right action button (Favorite / Delete) */
+    /* Right action pill button (Favorite / Delete) */
     lv_obj_t *rbtn = lv_btn_create(row);
-    lv_obj_set_pos(rbtn, 258, 0);
-    lv_obj_set_size(rbtn, 46, 28);
+    lv_obj_set_pos(rbtn, 256, 0);
+    lv_obj_set_size(rbtn, 48, 30);
     lv_obj_set_style_bg_color(rbtn, right_accent ? UI_COLOR_ACCENT : UI_COLOR_SURFACE_HIGH, 0);
     lv_obj_set_style_border_color(rbtn, right_accent ? UI_COLOR_ACCENT : UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(rbtn, 1, 0);
-    lv_obj_set_style_radius(rbtn, 5, 0);
+    lv_obj_set_style_radius(rbtn, 8, 0);
     lv_obj_set_style_shadow_width(rbtn, 0, 0);
+    lv_obj_set_style_translate_y(rbtn, 1, LV_STATE_PRESSED);
     lv_obj_set_style_pad_all(rbtn, 0, 0);
     lv_obj_add_event_cb(rbtn, right_cb, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
 
@@ -790,7 +823,7 @@ static void build_home_view(lv_obj_t *parent)
         lv_obj_set_pos(s_tab_btns[i], 4 + i * 68, 4);
         lv_obj_set_size(s_tab_btns[i], 64, 26);
         lv_obj_set_style_border_width(s_tab_btns[i], 1, 0);
-        lv_obj_set_style_radius(s_tab_btns[i], 6, 0);
+        lv_obj_set_style_radius(s_tab_btns[i], 9, 0);
         lv_obj_set_style_shadow_width(s_tab_btns[i], 0, 0);
         lv_obj_set_style_pad_all(s_tab_btns[i], 0, 0);
         lv_obj_add_event_cb(s_tab_btns[i], top_tab_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -810,7 +843,7 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_style_bg_color(btn_ply, UI_COLOR_SURFACE_HIGH, 0);
     lv_obj_set_style_border_color(btn_ply, UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(btn_ply, 1, 0);
-    lv_obj_set_style_radius(btn_ply, 6, 0);
+    lv_obj_set_style_radius(btn_ply, 9, 0);
     lv_obj_set_style_shadow_width(btn_ply, 0, 0);
     lv_obj_set_style_pad_all(btn_ply, 0, 0);
     lv_obj_add_event_cb(btn_ply, top_player_open_cb, LV_EVENT_CLICKED, NULL);
@@ -822,14 +855,14 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(lbl_ply, UI_FONT_CJK, 0);
 
     lv_obj_t *btn_os = lv_btn_create(topbar);
-    lv_obj_set_pos(btn_os, 257, 3);
-    lv_obj_set_size(btn_os, 59, 28);
+    lv_obj_set_pos(btn_os, 257, 4);
+    lv_obj_set_size(btn_os, 59, 26);
     lv_obj_set_ext_click_area(btn_os, 10);
     lv_obj_set_style_bg_color(btn_os, lv_color_hex(0x2E7CF6U), 0);
     lv_obj_set_style_bg_color(btn_os, lv_color_hex(0x1D63D8U), LV_STATE_PRESSED);
     lv_obj_set_style_border_color(btn_os, lv_color_hex(0x5596F8U), 0);
     lv_obj_set_style_border_width(btn_os, 1, 0);
-    lv_obj_set_style_radius(btn_os, 8, 0);
+    lv_obj_set_style_radius(btn_os, 9, 0);
     lv_obj_set_style_shadow_width(btn_os, 0, 0);
     lv_obj_set_style_pad_all(btn_os, 0, 0);
     lv_obj_set_flex_flow(btn_os, LV_FLEX_FLOW_ROW);
@@ -841,7 +874,7 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_t *sym_os = lv_label_create(btn_os);
     lv_label_set_text(sym_os, LV_SYMBOL_HOME);
     lv_obj_set_style_text_color(sym_os, lv_color_hex(0xFFFFFFU), 0);
-    lv_obj_set_style_text_font(sym_os, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(sym_os, &lv_font_montserrat_12, 0);
 
     lv_obj_t *lbl_os = lv_label_create(btn_os);
     lv_label_set_text(lbl_os, "桌面");
@@ -885,9 +918,9 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_style_bg_color(s_ta_search, UI_COLOR_SURFACE, 0);
     lv_obj_set_style_border_color(s_ta_search, UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(s_ta_search, 1, 0);
-    lv_obj_set_style_radius(s_ta_search, 6, 0);
+    lv_obj_set_style_radius(s_ta_search, 10, 0);
     lv_obj_set_style_pad_ver(s_ta_search, 4, 0);
-    lv_obj_set_style_pad_hor(s_ta_search, 6, 0);
+    lv_obj_set_style_pad_hor(s_ta_search, 10, 0);
     lv_obj_set_style_text_color(s_ta_search, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(s_ta_search, UI_FONT_CJK, 0);
     lv_obj_add_event_cb(s_ta_search, search_ta_click_cb, LV_EVENT_CLICKED, NULL);
@@ -896,8 +929,9 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_pos(btn_s, 258, 4);
     lv_obj_set_size(btn_s, 54, 28);
     lv_obj_set_style_bg_color(btn_s, UI_COLOR_ACCENT, 0);
-    lv_obj_set_style_radius(btn_s, 6, 0);
+    lv_obj_set_style_radius(btn_s, 10, 0);
     lv_obj_set_style_shadow_width(btn_s, 0, 0);
+    lv_obj_set_style_translate_y(btn_s, 1, LV_STATE_PRESSED);
     lv_obj_set_style_pad_all(btn_s, 0, 0);
     lv_obj_add_event_cb(btn_s, search_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_s = lv_label_create(btn_s);
@@ -921,9 +955,12 @@ static void build_home_view(lv_obj_t *parent)
         lv_obj_t *cbtn = lv_btn_create(chip_row);
         lv_obj_set_height(cbtn, 24);
         lv_obj_set_style_bg_color(cbtn, (i == 0) ? UI_COLOR_ACCENT : UI_COLOR_SURFACE_HIGH, 0);
+        lv_obj_set_style_border_color(cbtn, (i == 0) ? UI_COLOR_ACCENT : UI_COLOR_BORDER, 0);
+        lv_obj_set_style_border_width(cbtn, 1, 0);
         lv_obj_set_style_radius(cbtn, 12, 0);
         lv_obj_set_style_shadow_width(cbtn, 0, 0);
-        lv_obj_set_style_pad_hor(cbtn, 8, 0);
+        lv_obj_set_style_translate_y(cbtn, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_pad_hor(cbtn, 9, 0);
         lv_obj_add_event_cb(cbtn, quick_chip_cb, LV_EVENT_CLICKED, (void *)chips[i]);
         lv_obj_t *clbl = lv_label_create(cbtn);
         lv_obj_center(clbl);
@@ -1084,8 +1121,9 @@ static void build_left_column(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_data_chip, LV_OPA_70, 0);
     lv_obj_set_style_border_color(s_data_chip, UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(s_data_chip, 1, 0);
-    lv_obj_set_style_radius(s_data_chip, 4, 0);
+    lv_obj_set_style_radius(s_data_chip, 10, 0);
     lv_obj_set_style_shadow_width(s_data_chip, 0, 0);
+    lv_obj_set_style_translate_y(s_data_chip, 1, LV_STATE_PRESSED);
     lv_obj_set_style_pad_all(s_data_chip, 0, 0);
     lv_obj_set_user_data(s_data_chip, (void *)(intptr_t)UI_ACTION_BACK_HOME);
     lv_obj_add_event_cb(s_data_chip, action_btn_cb, LV_EVENT_CLICKED, NULL);
@@ -1429,12 +1467,13 @@ static void build_controls_section(lv_obj_t *parent)
     s_btn_play = lv_btn_create(parent);
     lv_obj_set_pos(s_btn_play, 57, 39);
     lv_obj_set_size(s_btn_play, 40, 40);
-    lv_obj_set_style_bg_color(s_btn_play, UI_COLOR_SURFACE, 0);
-    lv_obj_set_style_bg_opa(s_btn_play, LV_OPA_70, 0);
-    lv_obj_set_style_border_color(s_btn_play, UI_COLOR_BORDER, 0);
+    lv_obj_set_style_bg_color(s_btn_play, UI_COLOR_ACCENT, 0);
+    lv_obj_set_style_bg_opa(s_btn_play, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(s_btn_play, UI_COLOR_ACCENT_ALT, 0);
     lv_obj_set_style_border_width(s_btn_play, 1, 0);
     lv_obj_set_style_radius(s_btn_play, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_shadow_width(s_btn_play, 0, 0);
+    lv_obj_set_style_translate_y(s_btn_play, 1, LV_STATE_PRESSED);
     lv_obj_set_style_pad_all(s_btn_play, 0, 0);
     lv_obj_set_user_data(s_btn_play, (void *)(intptr_t)UI_ACTION_PLAY_PAUSE);
     lv_obj_add_event_cb(s_btn_play, action_btn_cb, LV_EVENT_CLICKED, NULL);

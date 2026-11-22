@@ -280,3 +280,11 @@ SWIFT_OS/ (注意正式编译时建议目录名不含空格)
 4. **Milestone 4：系统音频服务与“iSwift 音乐”迁移（预计 2~3 天）**
    * 将 ES8311 MP3/WAV 播放封装进 `os_audio_service.c` 并导出给 `.elf`。
    * 将现有 [playpal_iswift_hub](file:///c:/Users/Mark/Desktop/esp32/playpal_iswift_hub) 的 UI 与歌词/频谱逻辑迁移为标准 `com.swift.music` 应用包，实现**桌面点击启动音乐 + 退出回到桌面依然后台听歌**的完整体验。
+
+---
+
+## 9. UI 文案与排版铁律（详见 [Glam_OS_UI设计规范.md](file:///c:/Users/Mark/Desktop/esp32/Glam-OS/docs/Glam_OS_UI设计规范.md)）
+
+1. **极简文字**：所有的字都要减少，尽量不写字，除非必要（能用图标表达的绝不写字）。
+2. **禁止并排/并列/多列文字**：所有字体元素不允许做成并排、并列、多列，同一容器内必须纵向单列分行排布。
+3. **非必要不写**：没必要的说明、副标题、状态装饰文案一律不写。

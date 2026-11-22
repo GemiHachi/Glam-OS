@@ -20,19 +20,81 @@
 #include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "boot_anim.h"
 #include "hub_player.h"
 #include "nvs_flash.h"
 #include "os_spk_installer.h"
 #include "ui/os_ui.h"
+#include "ui/ui_manager.h"
 #include "wifi_portal.h"
+#include "xz/xz_service.h"
 
 static const char *TAG = "glam_os";
 static bool s_sntp_started = false;
+
+static void xz_hook_play_music(const char *keyword)
+{
+    if (keyword && keyword[0]) {
+        /* Route all XiaoZhi music requests directly to local G'lam Music search & autoplay */
+        char cmd[224];
+        snprintf(cmd, sizeof(cmd),
+                 "{\"type\":\"search\",\"keyword\":\"%.120s\",\"server\":\"netease\",\"autoplay\":true}",
+                 keyword);
+        os_ui_request_music_cmd(cmd);
+    } else {
+        if (audio_get_state() == BSP_AUDIO_STATE_PAUSED) {
+            audio_resume();
+            os_ui_request_music_cmd("");
+        } else if (!audio_is_playing()) {
+            os_ui_request_music_cmd("");
+            hub_player_trigger_action(UI_ACTION_PLAY_PAUSE);
+        } else {
+            os_ui_request_music_cmd("");
+        }
+    }
+}
+
+static void xz_hook_control_music(const char *action)
+{
+    if (!action || !action[0]) return;
+    if (strcmp(action, "pause") == 0) {
+        audio_pause();
+    } else if (strcmp(action, "stop") == 0) {
+        audio_stop();
+    } else if (strcmp(action, "play") == 0 || strcmp(action, "resume") == 0) {
+        if (audio_get_state() == BSP_AUDIO_STATE_PAUSED) {
+            audio_resume();
+        } else if (!audio_is_playing()) {
+            os_ui_request_music_cmd("");
+            hub_player_trigger_action(UI_ACTION_PLAY_PAUSE);
+        }
+    } else if (strcmp(action, "next") == 0) {
+        hub_player_trigger_action(UI_ACTION_NEXT);
+    } else if (strcmp(action, "prev") == 0) {
+        hub_player_trigger_action(UI_ACTION_PREV);
+    }
+}
+
+static void xz_hook_get_music_status(char *out_json, size_t max_len)
+{
+    if (!out_json || max_len == 0) return;
+    char title[64] = {0}, artist[48] = {0};
+    uint32_t cur_ms = 0, tot_ms = 0;
+    bool playing = false;
+    hub_player_get_now_playing(title, sizeof(title), artist, sizeof(artist),
+                               &cur_ms, &tot_ms, &playing);
+    const char *st = playing ? "playing" :
+                     (audio_get_state() == BSP_AUDIO_STATE_PAUSED ? "paused" : "stopped");
+    snprintf(out_json, max_len,
+             "{\"state\":\"%s\",\"title\":\"%s\",\"artist\":\"%s\"}",
+             st, title, artist);
+}
 
 static void on_wifi_status(bool connected, const char *ssid, const char *ip, const char *reason)
 {
     os_ui_notify_wifi(connected, ssid, ip, reason);
     hub_player_notify_wifi(connected, ssid, ip, reason);
+    xz_service_notify_wifi(connected, ssid, ip);
     if (connected) {
         if (!s_sntp_started) {
             s_sntp_started = true;
@@ -107,7 +169,27 @@ void app_main(void)
         os_ui_show_no_tf_shutdown();
         return;
     }
+    boot_anim_run();
     ESP_ERROR_CHECK(os_ui_init());
+    const xz_os_hooks_t xz_hooks = {
+        .set_brightness     = os_ui_request_brightness,
+        .get_brightness     = os_ui_get_brightness,
+        .set_theme          = os_ui_request_theme,
+        .get_theme_name     = os_ui_get_theme_name,
+        .play_music         = xz_hook_play_music,
+        .control_music      = xz_hook_control_music,
+        .get_music_status   = xz_hook_get_music_status,
+        .list_apps_json     = os_ui_list_apps_json,
+        .open_app           = os_ui_request_open_app,
+        .close_app          = os_ui_request_close_app,
+        .go_home            = os_ui_request_home,
+        .get_foreground_app = os_ui_get_foreground_app,
+        .control_pomodoro   = os_ui_request_pomodoro,
+        .on_wakeup          = os_ui_notify_xz_wakeup,
+        .on_overlay_end     = os_ui_notify_xz_overlay_end,
+        .post_toast         = os_ui_post_toast,
+    };
+    xz_service_init(&xz_hooks);
     ESP_ERROR_CHECK(os_installer_init(os_ui_notify_apps_updated));
     os_installer_set_uart_fallback(on_uart_preinit_fallback);
     ESP_ERROR_CHECK(wifi_portal_init(on_wifi_status));

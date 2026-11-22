@@ -19,11 +19,18 @@ extern "C" {
 #endif
 
 #define OS_MAX_APPS (24)
+#define OS_SYSTEM_APP_XIAOZHI_ID "com.glam.xiaozhi"
+
+typedef enum {
+    OS_APP_PRIV_USER = 0,       /* Standard TF-card user application */
+    OS_APP_PRIV_SYSTEM = 1,     /* Highest system privilege: non-removable, persistent service */
+} os_app_privilege_t;
 
 typedef enum {
     OS_APP_BG_KEEP_ALL = 0,     /* keep_all: suspend full app in RAM, pause timers */
     OS_APP_BG_PARTIAL_SVC = 1,  /* partial_service: release UI, keep background service */
     OS_APP_BG_KILL_ALL = 2,     /* kill_all: destroy and unload immediately on exit */
+    OS_APP_BG_PERSISTENT_SVC = 3, /* system daemon: auto-starts on boot, immune to clear-all */
 } os_app_bg_policy_t;
 
 typedef struct {
@@ -33,6 +40,9 @@ typedef struct {
     uint32_t accent_hex;
     uint32_t elf_size;
     uint8_t bg_policy;
+    uint8_t privilege;
+    bool is_system_app;
+    bool removable;
     bool from_sdcard;
     bool has_custom_icon;
     char icon_path[160];
@@ -66,8 +76,14 @@ esp_err_t os_installer_install_spk_buffer(const uint8_t *buf, size_t len,
 
 /**
  * @brief Uninstall an app from /sdcard/apps/<id>/ (optionally removing sandbox data).
+ *        Returns ESP_ERR_NOT_ALLOWED for protected system-privileged apps.
  */
 esp_err_t os_installer_uninstall_app(const char *app_id, bool delete_data);
+
+/**
+ * @brief Check whether an app ID belongs to a non-removable system-privileged app.
+ */
+bool os_installer_is_protected_app(const char *app_id);
 
 /**
  * @brief Register a fallback handler for non-installer UART0 JSON lines (e.g. Playpal Dock protocol).

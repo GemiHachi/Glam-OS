@@ -198,6 +198,10 @@ esp_err_t os_installer_install_spk_buffer(const uint8_t *buf, size_t len,
     if (err != ESP_OK) {
         return err;
     }
+    if (os_installer_is_protected_app(hdr.app_id)) {
+        snprintf(err_msg, err_len, "Protected system app cannot be overwritten");
+        return ESP_ERR_NOT_ALLOWED;
+    }
 
     ensure_sd_dirs();
     char app_dir[128];
@@ -379,6 +383,9 @@ static bool read_manifest_info(const char *app_id, os_app_info_t *info)
     info->accent_hex = 0x3B82F6U;
     info->elf_size = (uint32_t)st_elf.st_size;
     info->bg_policy = parse_manifest_bg_policy(NULL, app_id);
+    info->privilege = OS_APP_PRIV_USER;
+    info->is_system_app = false;
+    info->removable = true;
     info->from_sdcard = true;
 
     FILE *f = fopen(man_path, "rb");
@@ -438,10 +445,33 @@ static bool read_manifest_info(const char *app_id, os_app_info_t *info)
     return true;
 }
 
+bool os_installer_is_protected_app(const char *app_id)
+{
+    if (!app_id || !app_id[0]) return false;
+    return (strcmp(app_id, OS_SYSTEM_APP_XIAOZHI_ID) == 0);
+}
+
 int os_installer_list_apps(os_app_info_t *out_apps, int max_apps)
 {
     if (!out_apps || max_apps <= 0) return 0;
     int count = 0;
+
+    /* Built-in highest-privilege system app: XiaoZhi AI (visible in App Manager, non-removable) */
+    {
+        os_app_info_t *xz = &out_apps[count++];
+        memset(xz, 0, sizeof(*xz));
+        snprintf(xz->id, sizeof(xz->id), "%s", OS_SYSTEM_APP_XIAOZHI_ID);
+        snprintf(xz->name, sizeof(xz->name), "小智 AI");
+        snprintf(xz->version, sizeof(xz->version), "1.0.0");
+        xz->accent_hex = 0x14B8A6U;
+        xz->elf_size = 0;
+        xz->bg_policy = OS_APP_BG_PERSISTENT_SVC;
+        xz->privilege = OS_APP_PRIV_SYSTEM;
+        xz->is_system_app = true;
+        xz->removable = false;
+        xz->from_sdcard = false;
+        xz->has_custom_icon = false;
+    }
 
     if (bsp_sdcard_is_mounted()) {
         DIR *dir = opendir("/sdcard/apps");
@@ -450,6 +480,7 @@ int os_installer_list_apps(os_app_info_t *out_apps, int max_apps)
             while ((ent = readdir(dir)) != NULL && count < max_apps) {
                 if (ent->d_name[0] == '.') continue;
                 if (!is_valid_app_id(ent->d_name)) continue;
+                if (os_installer_is_protected_app(ent->d_name)) continue;
                 if (read_manifest_info(ent->d_name, &out_apps[count])) {
                     count++;
                 }
@@ -462,6 +493,10 @@ int os_installer_list_apps(os_app_info_t *out_apps, int max_apps)
 
 esp_err_t os_installer_uninstall_app(const char *app_id, bool delete_data)
 {
+    if (os_installer_is_protected_app(app_id)) {
+        ESP_LOGW(TAG, "Blocked uninstall attempt for protected system app: %s", app_id);
+        return ESP_ERR_NOT_ALLOWED;
+    }
     if (!bsp_sdcard_is_mounted() || !is_valid_app_id(app_id)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -558,7 +593,12 @@ static esp_err_t http_root_get(httpd_req_t *req)
 
 static esp_err_t http_apps_get(httpd_req_t *req)
 {
-    os_app_info_t apps[OS_MAX_APPS];
+    os_app_info_t *apps = (os_app_info_t *)heap_caps_calloc(
+        OS_MAX_APPS, sizeof(os_app_info_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!apps) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_ERR_NO_MEM;
+    }
     int n = os_installer_list_apps(apps, OS_MAX_APPS);
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < n; i++) {
@@ -568,8 +608,13 @@ static esp_err_t http_apps_get(httpd_req_t *req)
         cJSON_AddStringToObject(it, "version", apps[i].version);
         cJSON_AddNumberToObject(it, "elf_size", apps[i].elf_size);
         cJSON_AddBoolToObject(it, "sdcard", apps[i].from_sdcard);
+        cJSON_AddBoolToObject(it, "system", apps[i].is_system_app);
+        cJSON_AddBoolToObject(it, "removable", apps[i].removable);
+        cJSON_AddStringToObject(it, "privilege",
+                                apps[i].privilege == OS_APP_PRIV_SYSTEM ? "system" : "user");
         cJSON_AddItemToArray(arr, it);
     }
+    free(apps);
     char *json_str = cJSON_Print(arr);
     cJSON_Delete(arr);
     httpd_resp_set_type(req, "application/json; charset=utf-8");
@@ -645,8 +690,10 @@ static esp_err_t http_screenshot_get(httpd_req_t *req)
 
 static esp_err_t http_info_get(httpd_req_t *req)
 {
-    os_app_info_t apps[OS_MAX_APPS];
-    int app_cnt = os_installer_list_apps(apps, OS_MAX_APPS);
+    os_app_info_t *apps = (os_app_info_t *)heap_caps_calloc(
+        OS_MAX_APPS, sizeof(os_app_info_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int app_cnt = apps ? os_installer_list_apps(apps, OS_MAX_APPS) : 0;
+    if (apps) free(apps);
     uint32_t free_psram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     uint32_t free_sram = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
@@ -682,6 +729,11 @@ static esp_err_t http_uninstall_post(httpd_req_t *req)
     }
 
     esp_err_t err = os_installer_uninstall_app(app_id, false);
+    if (err == ESP_ERR_NOT_ALLOWED) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_send(req, "System privileged app cannot be uninstalled", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_send(req, "Uninstall failed", HTTPD_RESP_USE_STRLEN);
@@ -694,12 +746,37 @@ static esp_err_t http_uninstall_post(httpd_req_t *req)
     return httpd_resp_send(req, ok_msg, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t http_audio_diag_get(httpd_req_t *req)
+{
+    char *buf = (char *)heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    bsp_audio_get_diag_json(buf, 1024);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t res = httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return res;
+}
+
+static esp_err_t http_audio_beep_post(httpd_req_t *req)
+{
+    esp_err_t err = bsp_audio_test_beep(600);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "{\"ok\":%s,\"err\":\"%s\"}",
+             err == ESP_OK ? "true" : "false", esp_err_to_name(err));
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+}
+
 static void start_http_installer_server(void)
 {
     if (s_httpd) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 10;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to start HTTP installer server");
         return;
@@ -710,12 +787,16 @@ static void start_http_installer_server(void)
     static const httpd_uri_t uri_inst = { .uri = "/api/install", .method = HTTP_POST, .handler = http_install_post };
     static const httpd_uri_t uri_uninst = { .uri = "/api/uninstall", .method = HTTP_POST, .handler = http_uninstall_post };
     static const httpd_uri_t uri_shot = { .uri = "/api/screenshot", .method = HTTP_GET, .handler = http_screenshot_get };
+    static const httpd_uri_t uri_adiag = { .uri = "/api/audio_diag", .method = HTTP_GET, .handler = http_audio_diag_get };
+    static const httpd_uri_t uri_abeep = { .uri = "/api/audio_beep", .method = HTTP_POST, .handler = http_audio_beep_post };
     httpd_register_uri_handler(s_httpd, &uri_root);
     httpd_register_uri_handler(s_httpd, &uri_info);
     httpd_register_uri_handler(s_httpd, &uri_apps);
     httpd_register_uri_handler(s_httpd, &uri_inst);
     httpd_register_uri_handler(s_httpd, &uri_uninst);
     httpd_register_uri_handler(s_httpd, &uri_shot);
+    httpd_register_uri_handler(s_httpd, &uri_adiag);
+    httpd_register_uri_handler(s_httpd, &uri_abeep);
     ESP_LOGI(TAG, "Channel 2A HTTP Installer listening on port %d", cfg.server_port);
 }
 

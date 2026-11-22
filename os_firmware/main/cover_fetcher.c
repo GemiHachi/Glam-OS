@@ -322,10 +322,15 @@ static inline uint8_t clamp_u8_i(int v)
     return (uint8_t)v;
 }
 
-/* Replicate PlayerScreen.kt Layer 0: 120% center-crop + heavy blur + ~0.32 dark scrim */
-static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color_t *dst_bg)
+static void generate_blurred_bg_impl(const lv_color_t *src_fb, int src_w, int src_h,
+                                     int crop_x, int crop_y, int crop_w, int crop_h,
+                                     lv_color_t *dst_bg, int brightness_scale)
 {
-    if (!src_cover || !dst_bg) return;
+    if (!src_fb || src_w <= 0 || src_h <= 0 || !dst_bg) return;
+    if (crop_w <= 1) crop_w = src_w;
+    if (crop_h <= 1) crop_h = src_h;
+    if (brightness_scale < 0) brightness_scale = 0;
+    if (brightness_scale > 256) brightness_scale = 256;
 
     const int BW = 41; /* 40 intervals * 8 px = 320 px */
     const int BH = 31; /* 30 intervals * 8 px = 240 px */
@@ -340,18 +345,20 @@ static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color
         return;
     }
 
-    /* 1. 120% center-crop downsample with 2x2 neighborhood averaging */
+    /* 1. Downsample source region with 2x2 neighborhood averaging */
     for (int gy = 0; gy < BH; gy++) {
-        int cy = 8 + (gy * 79) / (BH - 1);
-        int cy1 = (cy + 1 < COVER_H) ? (cy + 1) : cy;
+        int cy = crop_y + (gy * (crop_h - 1)) / (BH - 1);
+        if (cy >= src_h) cy = src_h - 1;
+        int cy1 = (cy + 1 < src_h) ? (cy + 1) : cy;
         for (int gx = 0; gx < BW; gx++) {
-            int cx = 8 + (gx * 83) / (BW - 1);
-            int cx1 = (cx + 1 < COVER_W) ? (cx + 1) : cx;
+            int cx = crop_x + (gx * (crop_w - 1)) / (BW - 1);
+            if (cx >= src_w) cx = src_w - 1;
+            int cx1 = (cx + 1 < src_w) ? (cx + 1) : cx;
             lv_color32_t c00, c10, c01, c11;
-            c00.full = lv_color_to32(src_cover[cy * COVER_W + cx]);
-            c10.full = lv_color_to32(src_cover[cy * COVER_W + cx1]);
-            c01.full = lv_color_to32(src_cover[cy1 * COVER_W + cx]);
-            c11.full = lv_color_to32(src_cover[cy1 * COVER_W + cx1]);
+            c00.full = lv_color_to32(src_fb[cy * src_w + cx]);
+            c10.full = lv_color_to32(src_fb[cy * src_w + cx1]);
+            c01.full = lv_color_to32(src_fb[cy1 * src_w + cx]);
+            c11.full = lv_color_to32(src_fb[cy1 * src_w + cx1]);
             size_t idx = (size_t)(gy * BW + gx) * 3;
             buf_a[idx + 0] = (uint8_t)(((uint16_t)c00.ch.red + c10.ch.red + c01.ch.red + c11.ch.red) >> 2);
             buf_a[idx + 1] = (uint8_t)(((uint16_t)c00.ch.green + c10.ch.green + c01.ch.green + c11.ch.green) >> 2);
@@ -359,7 +366,7 @@ static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color
         }
     }
 
-    /* 2. Four passes of 5-tap separable box blur -> dreamy blur(80.dp) equivalent */
+    /* 2. Four passes of 5-tap separable box blur -> dreamy Gaussian equivalent */
     for (int pass = 0; pass < 4; pass++) {
         for (int y = 0; y < BH; y++) {
             for (int x = 0; x < BW; x++) {
@@ -399,9 +406,11 @@ static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color
         }
     }
 
-    /* 3. Apply ~0.32 dark tint scrim matching alpha=0.35 + 20% black overlay */
-    for (size_t i = 0; i < grid_bytes; i++) {
-        buf_a[i] = (uint8_t)(((uint16_t)buf_a[i] * 82) >> 8);
+    /* 3. Apply brightness scrim scale (0..256) */
+    if (brightness_scale != 256) {
+        for (size_t i = 0; i < grid_bytes; i++) {
+            buf_a[i] = (uint8_t)(((uint32_t)buf_a[i] * (uint32_t)brightness_scale) >> 8);
+        }
     }
 
     /* 4. Bayer-dithered bilinear upscale 41x31 -> 320x240 */
@@ -449,6 +458,18 @@ static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color
 
     free(buf_a);
     free(buf_b);
+}
+
+void cover_generate_blurred_bg(const lv_color_t *src_fb, int src_w, int src_h,
+                               lv_color_t *dst_bg, int brightness_scale)
+{
+    generate_blurred_bg_impl(src_fb, src_w, src_h, 0, 0, src_w, src_h, dst_bg, brightness_scale);
+}
+
+/* Replicate PlayerScreen.kt Layer 0: 120% center-crop + heavy blur + ~0.32 dark scrim */
+static void generate_blurred_bg_from_cover(const lv_color_t *src_cover, lv_color_t *dst_bg)
+{
+    generate_blurred_bg_impl(src_cover, COVER_W, COVER_H, 8, 8, 84, 80, dst_bg, 82);
 }
 
 static bool ensure_active_cover_buffers(void)

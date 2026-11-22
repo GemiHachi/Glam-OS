@@ -51,6 +51,7 @@ i2c_master_bus_handle_t bsp_i2c_get_handle(void);
 esp_err_t bsp_pca9557_init(void);
 esp_err_t bsp_pca9557_set_output_state(uint8_t gpio_bit, uint8_t level);
 esp_err_t bsp_pca9557_get_output_state(uint8_t *val);
+esp_err_t bsp_pca9557_read_hw_regs(uint8_t regs[4]);
 
 void bsp_lcd_cs_set(uint8_t level);
 void bsp_pa_en_set(uint8_t level);

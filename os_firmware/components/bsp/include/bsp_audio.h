@@ -21,12 +21,13 @@ extern "C" {
 #define BSP_I2S_BCK_IO              (14)          /* BCK IO14 */
 #define BSP_I2S_WS_IO               (13)          /* WS / LRCK IO13 */
 #define BSP_I2S_DO_IO               (45)          /* DOUT IO45 */
-#define BSP_I2S_DI_IO               (-1)
+#define BSP_I2S_DI_IO               (12)          /* DIN IO12 (ES7210 ADC on LCSC SZP S3) */
 
 /******************************************************************************/
-/*                        ES8311 Codec Configuration                          */
+/*                        ES8311 / ES7210 Codec Config                        */
 /******************************************************************************/
 #define ES8311_I2C_ADDR             (0x30)  /* 8-bit shifted I2C addr (0x18 << 1) expected by esp_codec_dev */
+#define ES7210_I2C_ADDR             (0x82)  /* 8-bit shifted I2C addr (0x41 << 1) on LCSC SZP S3 */
 #define BSP_AUDIO_DEFAULT_VOLUME    (70)
 
 /**
@@ -174,6 +175,85 @@ const char *audio_get_current_file(void);
  * @param cb Callback function
  */
 void audio_register_event_callback(bsp_audio_cb_t cb);
+
+/******************************************************************************/
+/*               Full-Duplex Voice & Microphone APIs (XiaoZhi AI)             */
+/******************************************************************************/
+
+/**
+ * @brief Check whether an ES7210 microphone ADC was detected and initialized.
+ */
+bool bsp_audio_has_mic(void);
+
+/**
+ * @brief Enter full-duplex voice mode at sample_rate_hz (e.g. 16000 Hz).
+ *        Automatically pauses active music playback and saves its audio format.
+ */
+esp_err_t bsp_audio_voice_begin(uint32_t sample_rate_hz);
+
+/**
+ * @brief Exit voice mode, close ES7210 RX, restore music audio format, and resume paused music.
+ */
+void bsp_audio_voice_end(void);
+
+/**
+ * @brief Check whether voice mode is currently active.
+ */
+bool bsp_audio_is_voice_active(void);
+
+/**
+ * @brief Read mono 16-bit PCM samples from the ES7210 microphone array.
+ *        Optionally returns peak absolute amplitude (0..32767) in out_peak.
+ */
+esp_err_t bsp_audio_voice_read(int16_t *mono_out, size_t samples, uint16_t *out_peak);
+
+/**
+ * @brief Write mono 16-bit PCM samples to ES8311 speaker output (duplicated to stereo).
+ */
+esp_err_t bsp_audio_voice_write(const int16_t *mono_in, size_t samples);
+
+/**
+ * @brief Control speaker power amplifier during voice mode.
+ */
+void bsp_audio_voice_set_pa(bool on);
+
+/**
+ * @brief Override whether bsp_audio_voice_end() should auto-resume previously paused music.
+ *        Call with false when XiaoZhi MCP explicitly pauses/stops/changes music.
+ */
+void bsp_audio_voice_set_resume_music(bool resume);
+
+/**
+ * @brief Start background silent wake-word capture (16kHz native when idle, or auto-tracking
+ *        music sample rate with real-time resampling to 16kHz during music playback).
+ */
+esp_err_t bsp_audio_wake_begin(void);
+
+/**
+ * @brief Stop background wake-word capture cleanly.
+ */
+void bsp_audio_wake_end(void);
+
+/**
+ * @brief Check whether background wake-word capture is currently active.
+ */
+bool bsp_audio_is_wake_active(void);
+
+/**
+ * @brief Read mono 16kHz 16-bit PCM samples for WakeNet9 wake-word detection.
+ *        Automatically resamples if I2S1 is currently running at a music sample rate (e.g. 44.1kHz).
+ */
+esp_err_t bsp_audio_wake_read_16k(int16_t *mono_16k_out, size_t samples_16k);
+
+/**
+ * @brief Format a JSON snapshot of live audio hardware state (PCA9557, ES8311 regs, I2S1 state).
+ */
+void bsp_audio_get_diag_json(char *out_json, size_t max_len);
+
+/**
+ * @brief Play a short diagnostic test tone directly through ES8311 + PA to verify speaker output.
+ */
+esp_err_t bsp_audio_test_beep(uint32_t duration_ms);
 
 #ifdef __cplusplus
 }

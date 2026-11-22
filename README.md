@@ -4,6 +4,7 @@
   <b>A Dynamic PSRAM ELF32 Operating System for ESP32-S3 (16MB Flash + 8MB Octal PSRAM)</b><br>
   <b>面向 ESP32-S3 的动态 PSRAM ELF32 操作系统</b><br><br>
   <a href="#english-technical-documentation">English Technical Documentation</a> &nbsp;|&nbsp; <a href="#中文技术文档">中文技术文档</a> &nbsp;|&nbsp;
+  <a href="CHANGELOG.md">Changelog / 更新日志</a> &nbsp;|&nbsp;
   <a href="https://github.com/mark3268867477-spec/Glamor">Companion PC Controller &amp; SDK (G'lamor)</a>
 </p>
 
@@ -56,9 +57,16 @@ G'lam OS includes a runtime hardware-adaptive Board Support Package (`components
 
 ### 6. `.gla` Package Format & Triple-Channel Distribution (`os_spk_installer`)
 Each `.gla` archive contains a 160-byte binary header (`GLAM` magic, backward-compatible with `SWPK`), IEEE 802.3 CRC32 checksum, `manifest.json`, embedded 40×40 JPEG icon, and `app.elf`:
-* **Channel 1 — Wi-Fi HTTP REST API (Port `80`)**: Web uploader (`GET /`), package installer (`POST /api/install`), telemetry & app list (`GET /api/info`, `GET /api/apps`), remote uninstaller (`POST /api/uninstall`), and 320×240 24-bit BMP framebuffer capture (`GET /api/screenshot`).
+* **Channel 1 — Wi-Fi HTTP REST API (Port `80`)**: Web uploader (`GET /`), package installer (`POST /api/install`), telemetry & app list (`GET /api/info`, `GET /api/apps`), remote uninstaller (`POST /api/uninstall`, returns `403` for system-privileged apps), 320×240 24-bit BMP framebuffer capture (`GET /api/screenshot`), and hardware audio diagnostics (`GET /api/audio_diag`, `POST /api/audio_beep`).
 * **Channel 2 — USB Serial Hot Push (`115200` bps)**: Chunked `gla_begin` / `gla_chunk` / `gla_end` JSON+Base64 transfer over UART/USB-Serial-JTAG while the OS is running.
 * **Channel 3 — Offline TF Card Installer**: Auto-scans `/sdcard/install/*.gla` or installs directly when tapped in the on-device File Manager.
+
+### 7. Native System-Level XiaoZhi AI Assistant (`com.glam.xiaozhi`)
+Deeply integrated into the G'lam OS kernel rather than running as an isolated demo (see [CHANGELOG.md](CHANGELOG.md) for full details):
+* **Highest-Privilege Non-Removable System App**: Registered as `OS_APP_PRIV_SYSTEM` with `OS_APP_BG_PERSISTENT_SVC`; visible in App Manager and Task Manager, protected from uninstallation (`403 Forbidden`) and clear-all actions.
+* **Always-On Background Offline Wake-Word Plugin (`ESP-SR WakeNet9`)**: Silently runs on boot from the dedicated 1MB `model` partition (`wn9_nihaoxiaozhi_tts`). Saying **"你好小智"** wakes the assistant from any screen or `.elf` app — even during 44.1 kHz music playback via real-time Q16 resampling (`44.1 kHz -> 16 kHz`).
+* **Dynamic Island Global Voice Fusion**: Mounted on `lv_layer_top()` above all apps; auto-expands on wake with live STT/TTS captions, mic level bar, full-screen expressive face switch, and auto-collapse back to wake listening.
+* **13-Tool Local Device MCP Server (`xz_mcp`)**: Controls local apps (`app.list` / `open` / `close` / `go_home`), system settings (volume, brightness, theme, wakeup toggle, reboot), Pomodoro clock, and routes **100% of music requests exclusively to local G'lam Music** (`self.music.play` / `self.music.control`) with seamless post-TTS audio handoff.
 
 ---
 
@@ -79,7 +87,7 @@ Each `.gla` archive contains a 160-byte binary header (`GLAM` magic, backward-co
 | **SoC Module** | `ESP32-S3-WROOM-1-N16R8` | Dual-Core Xtensa LX7 @ 240MHz, 16MB Quad Flash, 8MB Octal PSRAM |
 | **Display** | 2.0" IPS LCD `ST7789` (320×240) | SPI3: `MOSI=IO40`, `CLK=IO41`, `CS=PCA9557_IO0`, `DC=IO39`, `BL=IO42` |
 | **Touch** | `FT6X36` / `FT5x06` Capacitive | I2C0: `SDA=IO1`, `SCL=IO2` (auto-probes `CST816S` / `GT911` on other boards) |
-| **Audio** | `ES8311` DAC + `NS4150B` Amp | I2C0 Control; I2S1: `MCLK=IO38`, `BCLK=IO14`, `WS=IO13`, `DOUT=IO45`, `PA_EN=PCA9557_IO1` |
+| **Audio** | `ES8311` DAC + `ES7210` Mic ADC + `NS4150B` Amp | I2C0 Control (`0x18` / `0x41`); Full-Duplex I2S1: `MCLK=IO38`, `BCLK=IO14`, `WS=IO13`, `DOUT=IO45`, `DIN=IO12`, `PA_EN=PCA9557_IO1` |
 | **6-Axis IMU** | `QMI8658` / `MPU6050` | I2C0 (`0x6A` / `0x6B` / `0x68`), directly accessible by `.elf` apps via whitelisted I2C ABI |
 | **TF Card** | MicroSD (FAT32) | SDMMC 1-Bit (`CMD=IO48`, `CLK=IO47`, `D0=IO21`) or SPI TF depending on board profile |
 | **Home Button** | Tactile Key | `GPIO0` (returns to OS home screen) |
@@ -149,9 +157,16 @@ G'lam OS 不依赖字节码虚拟机或脚本解释器，而是直接运行原�
   * **IMU 探测与 TF 卡免编译覆盖**：自动探测 `QMI8658 (0x6A/0x6B)` 与 `MPU6050 (0x68/0x69)`；挂载 TF 卡后自动加载 `/sdcard/board.json` 进行免编译参数覆盖。
 
 ### 6. `.gla` 二进制封装格式与三通道安全分发 (`os_spk_installer`)
-* **通道 1 — Wi-Fi HTTP REST API（端口 `80`）**：网页上传（`GET /`）、安装校验（`POST /api/install`）、状态查询（`GET /api/info`、`GET /api/apps`）、远程卸载（`POST /api/uninstall`）与 320×240 BMP 实时抓屏（`GET /api/screenshot`）。
+* **通道 1 — Wi-Fi HTTP REST API（端口 `80`）**：网页上传（`GET /`）、安装校验（`POST /api/install`）、状态查询（`GET /api/info`、`GET /api/apps`）、远程卸载（`POST /api/uninstall`，系统级保护应用返回 `403`）、320×240 BMP 实时抓屏（`GET /api/screenshot`）以及音频硬件诊断（`GET /api/audio_diag`、`POST /api/audio_beep`）。
 * **通道 2 — USB 串口热传输（`115200` bps）**：通过 `gla_begin` / `gla_chunk` / `gla_end` JSON+Base64 分块协议安全写入 TF 卡。
 * **通道 3 — TF 卡离线扫描与文件管理直装**：自动扫描 `/sdcard/install/*.gla` 或在文件管理器中点击直接安装。
+
+### 7. 系统级原生小智 AI 语音助手（`com.glam.xiaozhi`）
+深度内置于 G'lam OS 内核与全局交互框架（完整更新说明见 [CHANGELOG.md](CHANGELOG.md)）：
+* **最高权限不可卸载系统应用**：以 `OS_APP_PRIV_SYSTEM` 与 `OS_APP_BG_PERSISTENT_SVC` 注册，可在「应用管理」与「多任务后台」查看状态，免受一键清理，安装器与 HTTP API 均禁止删除。
+* **开机静默后台离线唤醒插件（ESP-SR WakeNet9）**：内置 1MB `model` 分区（`wn9_nihaoxiaozhi_tts`），开机后台常驻监听 **「你好小智」**；支持全系统任意页面及 `.elf` 应用随时唤醒，音乐播放中亦可通过 Q16 实时重采样（44.1 kHz → 16 kHz）伴随唤醒并智能暂停/恢复音乐。
+* **深度融合「灵动岛」全局语音浮层**：挂载在 `lv_layer_top()` 顶层，唤醒自动展开展示 STT/TTS 字幕与实时麦克风电平条，支持一键切入全屏表情交互视图或收起恢复待命。
+* **13 项本地设备端 MCP 控制与本地音乐独家接管**：直接语音操控全部本地应用、音量、亮度、主题、番茄钟、唤醒开关与重启，并将全部点歌与播控指令 100% 路由至本地 G'lam 音乐引擎（不走云端音乐）。
 
 ---
 
@@ -172,7 +187,7 @@ G'lam OS 不依赖字节码虚拟机或脚本解释器，而是直接运行原�
 | **主控模组** | `ESP32-S3-WROOM-1-N16R8` | 双核 Xtensa LX7 @ 240MHz，16MB Quad Flash，8MB Octal PSRAM |
 | **显示屏** | 2.0" IPS LCD `ST7789` (320×240) | SPI3: `MOSI=IO40`, `CLK=IO41`, `CS=PCA9557_IO0`, `DC=IO39`, `BL=IO42` |
 | **电容触控** | `FT6X36` / `FT5x06` | I2C0: `SDA=IO1`, `SCL=IO2`（支持自动探测 `CST816S` / `GT911`） |
-| **音频链路** | `ES8311` DAC + `NS4150B` 功放 | I2C0 控制；I2S1: `MCLK=IO38`, `BCLK=IO14`, `WS=IO13`, `DOUT=IO45`, `PA_EN=PCA9557_IO1` |
+| **音频链路** | `ES8311` DAC + `ES7210` 双麦 ADC + `NS4150B` 功放 | I2C0 控制（`0x18` / `0x41`）；全双工 I2S1: `MCLK=IO38`, `BCLK=IO14`, `WS=IO13`, `DOUT=IO45`, `DIN=IO12`, `PA_EN=PCA9557_IO1` |
 | **六轴传感器**| `QMI8658` / `MPU6050` | I2C0 (`0x6A` / `0x6B` / `0x68`)，动态 `.elf` 应用可通过白名单 I2C 接口直接读取 |
 | **TF 卡槽** | MicroSD (FAT32) | SDMMC 1-Line (`CMD=IO48`, `CLK=IO47`, `D0=IO21`) 或 SPI TF（随板型自动切换） |
 | **物理 Home 键**| 板载按键 | `GPIO0`（短按返回系统主桌面） |
