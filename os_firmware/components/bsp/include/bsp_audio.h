@@ -255,6 +255,23 @@ void bsp_audio_get_diag_json(char *out_json, size_t max_len);
  */
 esp_err_t bsp_audio_test_beep(uint32_t duration_ms);
 
+/**
+ * @brief Start playing a repeating alarm/timer chime in a background task.
+ *        Pauses active music (resuming on stop), ensures audible volume,
+ *        and stops after max_duration_ms or when bsp_audio_alarm_stop() is called.
+ */
+esp_err_t bsp_audio_alarm_start(uint32_t max_duration_ms);
+
+/**
+ * @brief Stop any currently ringing alarm chime immediately.
+ */
+void bsp_audio_alarm_stop(void);
+
+/**
+ * @brief Check whether the alarm chime is currently ringing.
+ */
+bool bsp_audio_is_alarm_ringing(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -88,6 +88,9 @@ static SemaphoreHandle_t s_stream_closed_sem = NULL;
 static SemaphoreHandle_t s_voice_lock = NULL;
 static volatile bool s_stream_abort_flag = false;
 static volatile bool s_suppress_idle_evt = false;
+static volatile bool s_alarm_ringing = false;
+static volatile bool s_alarm_stop_req = false;
+static TaskHandle_t s_alarm_task = NULL;
 
 /* Playback metrics for progress tracking */
 static uint32_t s_sample_rate = 44100;
@@ -529,6 +532,7 @@ esp_err_t audio_play_file(const char *path)
 
     ESP_LOGI(TAG, "Requesting playback of '%s'", path);
 
+    bsp_audio_alarm_stop();
     audio_stream_request_abort();
 
     /* If already playing, stop current playback */
@@ -580,6 +584,7 @@ esp_err_t audio_play_memory(void *buf, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
 
+    bsp_audio_alarm_stop();
     audio_stream_request_abort();
 
     if (s_audio_state == BSP_AUDIO_STATE_PLAYING || s_audio_state == BSP_AUDIO_STATE_PAUSED) {
@@ -1175,6 +1180,7 @@ static void voice_unlock(void)
 
 esp_err_t bsp_audio_voice_begin(uint32_t sample_rate_hz)
 {
+    bsp_audio_alarm_stop();
     if (!s_audio_initialized) {
         ESP_RETURN_ON_ERROR(bsp_audio_init(), TAG, "Voice begin failed: audio not init");
     }
@@ -1698,5 +1704,183 @@ esp_err_t bsp_audio_test_beep(uint32_t duration_ms)
     bsp_pa_en_set(0);
     voice_unlock();
     return ret;
+}
+
+typedef struct {
+    float freq_hz;
+    uint16_t dur_ms;
+    uint16_t gap_ms;
+} alarm_note_t;
+
+static void alarm_write_tone_locked(uint32_t rate, float freq_hz, uint16_t dur_ms, int16_t *buf)
+{
+    uint32_t total_frames = (rate * dur_ms) / 1000U;
+    uint32_t attack_frames = (rate * 8U) / 1000U;
+    if (attack_frames < 1) attack_frames = 1;
+    uint32_t done = 0;
+    const float w1 = 2.0f * 3.14159265f * freq_hz / (float)rate;
+    const float w2 = 2.0f * 3.14159265f * (freq_hz * 2.0f) / (float)rate;
+
+    while (done < total_frames && !s_alarm_stop_req) {
+        uint32_t n = total_frames - done;
+        if (n > 256) n = 256;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t idx = done + i;
+            float env = 1.0f;
+            if (idx < attack_frames) {
+                env = (float)idx / (float)attack_frames;
+            } else {
+                float p = (float)(idx - attack_frames) / (float)(total_frames > attack_frames ? (total_frames - attack_frames) : 1);
+                env = expf(-3.2f * p);
+            }
+            float wave = sinf(w1 * (float)idx) + 0.30f * sinf(w2 * (float)idx);
+            int32_t v = (int32_t)(13500.0f * env * wave);
+            if (v > 24000) v = 24000;
+            else if (v < -24000) v = -24000;
+            buf[i * 2] = (int16_t)v;
+            buf[i * 2 + 1] = (int16_t)v;
+        }
+        if (esp_codec_dev_write(s_play_dev, buf, (int)(n * 2 * sizeof(int16_t))) != ESP_OK) {
+            break;
+        }
+        done += n;
+    }
+}
+
+static void alarm_write_silence_locked(uint32_t rate, uint16_t dur_ms, int16_t *buf)
+{
+    uint32_t total_frames = (rate * dur_ms) / 1000U;
+    memset(buf, 0, 256 * 2 * sizeof(int16_t));
+    uint32_t done = 0;
+    while (done < total_frames && !s_alarm_stop_req) {
+        uint32_t n = total_frames - done;
+        if (n > 256) n = 256;
+        if (esp_codec_dev_write(s_play_dev, buf, (int)(n * 2 * sizeof(int16_t))) != ESP_OK) {
+            break;
+        }
+        done += n;
+    }
+}
+
+static void alarm_ring_task(void *arg)
+{
+    uint32_t max_ms = (uint32_t)(uintptr_t)arg;
+    if (max_ms < 2000) max_ms = 2000;
+    if (max_ms > 120000) max_ms = 120000;
+
+    static const alarm_note_t k_chime[] = {
+        { 880.0f,  110, 30 },  /* A5  */
+        { 1108.7f, 110, 30 },  /* C#6 */
+        { 1318.5f, 110, 30 },  /* E6  */
+        { 1760.0f, 240, 40 },  /* A6  */
+    };
+
+    int16_t *buf = (int16_t *)heap_caps_calloc(256 * 2, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) buf = (int16_t *)calloc(256 * 2, sizeof(int16_t));
+
+    bool paused_music = false;
+    if (s_audio_state == BSP_AUDIO_STATE_PLAYING) {
+        paused_music = true;
+        audio_pause();
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    int64_t end_us = esp_timer_get_time() + (int64_t)max_ms * 1000LL;
+    ESP_LOGI(TAG, "Alarm ringtone started (max %lu ms, paused_music=%d)",
+             (unsigned long)max_ms, paused_music ? 1 : 0);
+
+    while (buf && !s_alarm_stop_req && esp_timer_get_time() < end_us) {
+        if (s_voice_active) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        voice_lock();
+        if (!s_alarm_stop_req && !s_voice_active && s_play_dev) {
+            bsp_rec_close_locked();
+            uint32_t rate = s_cur_i2s_rate ? s_cur_i2s_rate : 16000;
+            uint8_t alarm_vol = (s_volume < 65) ? 65 : s_volume;
+            bsp_es8311_ensure_dac_ready();
+            esp_codec_dev_set_out_vol(s_play_dev, alarm_vol);
+            bsp_pa_en_set(1);
+
+            for (size_t i = 0; i < sizeof(k_chime) / sizeof(k_chime[0]) && !s_alarm_stop_req; i++) {
+                alarm_write_tone_locked(rate, k_chime[i].freq_hz, k_chime[i].dur_ms, buf);
+                if (k_chime[i].gap_ms > 0 && !s_alarm_stop_req) {
+                    alarm_write_silence_locked(rate, k_chime[i].gap_ms, buf);
+                }
+            }
+
+            /* Flush silence and shut down PA cleanly */
+            memset(buf, 0, 256 * 2 * sizeof(int16_t));
+            esp_codec_dev_write(s_play_dev, buf, 256 * 2 * sizeof(int16_t));
+            bsp_pa_en_set(0);
+            esp_codec_dev_set_out_vol(s_play_dev, s_volume);
+        }
+        voice_unlock();
+
+        /* Quiet interval between alarm phrases (~600ms, interruptible every 25ms) */
+        for (int k = 0; k < 24 && !s_alarm_stop_req && esp_timer_get_time() < end_us; k++) {
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+    }
+
+    if (buf) free(buf);
+
+    s_alarm_ringing = false;
+    s_alarm_task = NULL;
+    ESP_LOGI(TAG, "Alarm ringtone stopped (paused_music=%d)", paused_music ? 1 : 0);
+
+    if (paused_music && !s_voice_active && s_audio_state == BSP_AUDIO_STATE_PAUSED) {
+        audio_resume();
+    }
+    vTaskDelete(NULL);
+}
+
+esp_err_t bsp_audio_alarm_start(uint32_t max_duration_ms)
+{
+    if (!s_audio_initialized || !s_play_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_alarm_ringing) {
+        return ESP_OK;
+    }
+    if (max_duration_ms == 0) {
+        max_duration_ms = 45000;
+    }
+    s_alarm_stop_req = false;
+    s_alarm_ringing = true;
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
+        alarm_ring_task, "bsp_alarm", 4096,
+        (void *)(uintptr_t)max_duration_ms, 5, &s_alarm_task, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreatePinnedToCore(
+            alarm_ring_task, "bsp_alarm", 4096,
+            (void *)(uintptr_t)max_duration_ms, 5, &s_alarm_task, 1);
+    }
+    if (ok != pdPASS) {
+        s_alarm_ringing = false;
+        s_alarm_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void bsp_audio_alarm_stop(void)
+{
+    if (!s_alarm_ringing && !s_alarm_task) {
+        return;
+    }
+    s_alarm_stop_req = true;
+    /* Wait briefly for task to release voice_lock & turn off PA */
+    for (int i = 0; i < 40 && s_alarm_ringing; i++) {
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+}
+
+bool bsp_audio_is_alarm_ringing(void)
+{
+    return s_alarm_ringing;
 }
 

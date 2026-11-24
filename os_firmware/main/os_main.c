@@ -24,9 +24,11 @@
 #include "hub_player.h"
 #include "nvs_flash.h"
 #include "os_spk_installer.h"
+#include "ui/os_i18n.h"
 #include "ui/os_ui.h"
 #include "ui/ui_manager.h"
 #include "wifi_portal.h"
+#include "xz/xz_mcp.h"
 #include "xz/xz_service.h"
 
 static const char *TAG = "glam_os";
@@ -105,7 +107,7 @@ static void on_wifi_status(bool connected, const char *ssid, const char *ip, con
             esp_sntp_init();
         }
         char msg[80];
-        snprintf(msg, sizeof(msg), "Wi-Fi 已连: %.63s", ip ? ip : "");
+        snprintf(msg, sizeof(msg), TR("Wi-Fi 已连: %.63s", "Wi-Fi OK: %.63s"), ip ? ip : "");
         os_ui_post_toast(msg);
     } else if (reason && reason[0]) {
         ESP_LOGI(TAG, "Wi-Fi status: %s", reason);
@@ -160,6 +162,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Load persisted language (ZH / EN) and set default local timezone early */
+    os_i18n_init();
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -170,6 +177,9 @@ void app_main(void)
         return;
     }
     boot_anim_run();
+    if (!os_i18n_is_configured()) {
+        os_ui_run_first_boot_lang_select();
+    }
     ESP_ERROR_CHECK(os_ui_init());
     const xz_os_hooks_t xz_hooks = {
         .set_brightness     = os_ui_request_brightness,
@@ -189,6 +199,7 @@ void app_main(void)
         .on_overlay_end     = os_ui_notify_xz_overlay_end,
         .post_toast         = os_ui_post_toast,
     };
+    xz_mcp_init_pc_bridge();
     xz_service_init(&xz_hooks);
     ESP_ERROR_CHECK(os_installer_init(os_ui_notify_apps_updated));
     os_installer_set_uart_fallback(on_uart_preinit_fallback);

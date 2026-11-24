@@ -52,6 +52,7 @@ bool ui_is_24key_keyboard_open(void);
 /* SWIFT OS Integration: Show/Hide Music Hub Views */
 void ui_show_music_app(bool show_player);
 void ui_hide_all(void);
+void ui_manager_refresh_language(void);
 
 /* Now Playing View APIs */
 void ui_show_player_view(bool show);

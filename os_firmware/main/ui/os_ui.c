@@ -11,6 +11,7 @@
  */
 
 #include "os_ui.h"
+#include "os_i18n.h"
 #include "os_kbd24.h"
 #include "os_xz_view.h"
 #include "ui_manager.h"
@@ -21,6 +22,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include "bsp.h"
@@ -92,6 +94,7 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    const char *name_en;
     uint32_t bg_top;
     uint32_t bg_bot;
     uint32_t status_bg;
@@ -118,6 +121,7 @@ static const os_theme_t s_themes[3] = {
     /* 0: 经典深色 (默认：深空蓝灰基底 + 标准系统蓝点缀) */
     {
         .name          = "经典深色",
+        .name_en       = "Dark",
         .bg_top        = 0x12151CU,
         .bg_bot        = 0x161A22U,
         .status_bg     = 0x0F1218U,
@@ -142,6 +146,7 @@ static const os_theme_t s_themes[3] = {
     /* 1: 初雪 (纯净浅灰白底 + 标准系统蓝点缀) */
     {
         .name          = "初雪",
+        .name_en       = "Light",
         .bg_top        = 0xF2F4F8U,
         .bg_bot        = 0xEAEFF5U,
         .status_bg     = 0xFFFFFFU,
@@ -166,6 +171,7 @@ static const os_theme_t s_themes[3] = {
     /* 2: 深邃 (纯黑基底 + 深炭浮层卡片 + 澄澈系统蓝点缀) */
     {
         .name          = "深邃",
+        .name_en       = "OLED",
         .bg_top        = 0x000000U,
         .bg_bot        = 0x000000U,
         .status_bg     = 0x000000U,
@@ -193,6 +199,12 @@ static uint8_t s_theme_idx = 0;
 static inline const os_theme_t *T(void)
 {
     return &s_themes[s_theme_idx < 3 ? s_theme_idx : 0];
+}
+
+static inline const char *theme_display_name(uint8_t idx)
+{
+    const os_theme_t *th = &s_themes[idx < 3 ? idx : 0];
+    return os_i18n_is_en() ? th->name_en : th->name;
 }
 
 /* Cross-task pending event state protected by spinlock */
@@ -238,6 +250,7 @@ static lv_obj_t *s_btn_cc_trigger = NULL;
 static lv_obj_t *s_lbl_net_sd = NULL;
 static lv_obj_t *s_btn_edit_add = NULL;
 static lv_obj_t *s_btn_edit_done = NULL;
+static lv_obj_t *s_lbl_edit_done = NULL;
 static lv_obj_t *s_btn_home = NULL;
 static lv_obj_t *s_lbl_home_btn = NULL;
 static lv_obj_t *s_body = NULL;
@@ -359,15 +372,28 @@ typedef struct {
 static fm_entry_t s_fm_items[32];
 static int s_fm_count = 0;
 
-/* Pomodoro Clock state */
+/* Pomodoro Clock & Daily Alarm state */
+static int s_pomo_total_sec = 25 * 60;
 static int s_pomo_sec = 25 * 60;
 static bool s_pomo_running = false;
+static bool s_alarm_enabled = false;
+static uint8_t s_alarm_hour = 7;
+static uint8_t s_alarm_min = 30;
+static int32_t s_alarm_last_fired_key = -1;
+static uint8_t s_alarm_ring_mode = 0; /* 0=none, 1=pomodoro done, 2=daily alarm */
 static lv_obj_t *s_lbl_pomo = NULL;
+static lv_obj_t *s_lbl_pomo_sub = NULL;
 static lv_obj_t *s_arc_pomo = NULL;
 static lv_obj_t *s_lbl_pomo_state = NULL;
 static lv_obj_t *s_lbl_pomo_btn = NULL;
+static lv_obj_t *s_btn_pomo_toggle = NULL;
 static lv_obj_t *s_lbl_clk_hh = NULL;
 static lv_obj_t *s_lbl_clk_mm = NULL;
+static lv_obj_t *s_lbl_clk_hdr = NULL;
+static lv_obj_t *s_btn_clk_alarm = NULL;
+static lv_obj_t *s_lbl_clk_alarm_btn = NULL;
+static lv_obj_t *s_clock_modal = NULL;
+static lv_obj_t *s_alarm_overlay = NULL;
 
 /* Calculator state */
 static char s_calc_disp[32] = "0";
@@ -413,12 +439,20 @@ static void toggle_island_popup(void);
 static void close_island_popup(void);
 static void open_os_wifi_modal(void);
 static void close_os_wifi_modal(void);
+static void close_clock_modal(void);
+static void open_sys_time_modal(void);
+static void open_alarm_set_modal(void);
+static void on_open_sys_time_click(lv_event_t *e);
+static void on_open_alarm_set_click(lv_event_t *e);
+static void trigger_alarm_ring(uint8_t mode);
+static void stop_alarm_ring(void);
 static void apply_chrome_theme_styles(void);
 static void rebuild_wallpaper_buffer(void);
 static void refresh_home_live_widgets(void);
 static uint8_t s_eq_phase = 0;
 
 static void refresh_dynamic_island(void);
+static void refresh_cc_tiles(void);
 
 /* ========================================================================= */
 /*                           Color & Theme Helpers                           */
@@ -466,6 +500,44 @@ static void save_theme_id(uint8_t idx)
     nvs_handle_t h = 0;
     if (nvs_open(THEME_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, THEME_NVS_KEY, idx);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void load_clock_prefs(void)
+{
+    nvs_handle_t h = 0;
+    if (nvs_open(THEME_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        uint16_t psec = 0;
+        if (nvs_get_u16(h, "pomo_sec", &psec) == ESP_OK && psec >= 10 && psec <= 7200) {
+            s_pomo_total_sec = (int)psec;
+            s_pomo_sec = s_pomo_total_sec;
+        }
+        uint8_t aen = 0;
+        if (nvs_get_u8(h, "alarm_en", &aen) == ESP_OK) {
+            s_alarm_enabled = (aen != 0);
+        }
+        uint16_t ahm = 0;
+        if (nvs_get_u16(h, "alarm_hm", &ahm) == ESP_OK) {
+            uint8_t hh = (uint8_t)(ahm >> 8);
+            uint8_t mm = (uint8_t)(ahm & 0xFF);
+            if (hh < 24 && mm < 60) {
+                s_alarm_hour = hh;
+                s_alarm_min = mm;
+            }
+        }
+        nvs_close(h);
+    }
+}
+
+static void save_clock_prefs(void)
+{
+    nvs_handle_t h = 0;
+    if (nvs_open(THEME_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, "pomo_sec", (uint16_t)s_pomo_total_sec);
+        nvs_set_u8(h, "alarm_en", s_alarm_enabled ? 1 : 0);
+        nvs_set_u16(h, "alarm_hm", (uint16_t)(((uint16_t)s_alarm_hour << 8) | s_alarm_min));
         nvs_commit(h);
         nvs_close(h);
     }
@@ -946,7 +1018,7 @@ static void bg_task_register(bg_kind_t kind, bg_policy_t policy, const char *id,
     item.policy = policy;
     item.builtin_view = view;
     snprintf(item.id, sizeof(item.id), "%s", id ? id : "");
-    snprintf(item.name, sizeof(item.name), "%s", name ? name : "应用");
+    snprintf(item.name, sizeof(item.name), "%s", name ? name : TR("应用", "App"));
 
     int shift_from = (found >= 0) ? found : (MAX_BG_TASKS - 1);
     for (int i = shift_from; i > 0; i--) {
@@ -1088,7 +1160,7 @@ int os_ui_get_brightness(void)
 
 const char *os_ui_get_theme_name(void)
 {
-    return T()->name;
+    return theme_display_name(s_theme_idx);
 }
 
 void os_ui_notify_xz_wakeup(void)
@@ -1109,17 +1181,17 @@ void os_ui_notify_xz_overlay_end(void)
 const char *os_ui_get_foreground_app(void)
 {
     switch (s_cur_view) {
-    case VIEW_HOME:          return "桌面";
-    case VIEW_MUSIC_APP:     return "G'lam 音乐";
-    case VIEW_SETTINGS:      return "设置";
-    case VIEW_FILES:         return "文件管理";
-    case VIEW_IMAGE_PREVIEW: return "图片预览";
-    case VIEW_APPSTORE:      return "应用管理";
-    case VIEW_CLOCK:         return "时钟";
-    case VIEW_CALC:          return "计算器";
-    case VIEW_XIAOZHI:       return "小智 AI";
-    case VIEW_ELF_APP:       return s_active_elf_name[0] ? s_active_elf_name : "动态应用";
-    default:                 return "桌面";
+    case VIEW_HOME:          return TR("桌面", "Home");
+    case VIEW_MUSIC_APP:     return TR("G'lam 音乐", "G'lam Music");
+    case VIEW_SETTINGS:      return TR("设置", "Settings");
+    case VIEW_FILES:         return TR("文件管理", "Files");
+    case VIEW_IMAGE_PREVIEW: return TR("图片预览", "Image");
+    case VIEW_APPSTORE:      return TR("应用管理", "Apps");
+    case VIEW_CLOCK:         return TR("时钟", "Clock");
+    case VIEW_CALC:          return TR("计算器", "Calculator");
+    case VIEW_XIAOZHI:       return TR("小智 AI", "XiaoZhi AI");
+    case VIEW_ELF_APP:       return s_active_elf_name[0] ? s_active_elf_name : TR("动态应用", "App");
+    default:                 return TR("桌面", "Home");
     }
 }
 
@@ -1132,19 +1204,19 @@ void os_ui_list_apps_json(char *out_json, size_t max_len)
         return;
     }
 
-    static const struct { const char *id; const char *name; const char *priv; } k_sys[] = {
-        { OS_SYSTEM_APP_XIAOZHI_ID, "小智 AI",  "system" },
-        { "com.glam.music",         "G'lam 音乐", "builtin" },
-        { "os.settings",            "设置",     "builtin" },
-        { "os.files",               "文件管理", "builtin" },
-        { "os.appstore",            "应用管理", "builtin" },
-        { "os.clock",               "时钟",     "builtin" },
-        { "os.calc",                "计算器",   "builtin" },
+    static const struct { const char *id; const char *name_zh; const char *name_en; const char *priv; } k_sys[] = {
+        { OS_SYSTEM_APP_XIAOZHI_ID, "小智 AI",  "XiaoZhi AI",  "system" },
+        { "com.glam.music",         "G'lam 音乐", "G'lam Music", "builtin" },
+        { "os.settings",            "设置",     "Settings",    "builtin" },
+        { "os.files",               "文件管理", "Files",       "builtin" },
+        { "os.appstore",            "应用管理", "Apps",        "builtin" },
+        { "os.clock",               "时钟",     "Clock",       "builtin" },
+        { "os.calc",                "计算器",   "Calculator",  "builtin" },
     };
     for (size_t i = 0; i < sizeof(k_sys) / sizeof(k_sys[0]); i++) {
         cJSON *o = cJSON_CreateObject();
         cJSON_AddStringToObject(o, "id", k_sys[i].id);
-        cJSON_AddStringToObject(o, "name", k_sys[i].name);
+        cJSON_AddStringToObject(o, "name", os_i18n_is_en() ? k_sys[i].name_en : k_sys[i].name_zh);
         cJSON_AddStringToObject(o, "privilege", k_sys[i].priv);
         cJSON_AddBoolToObject(o, "removable", false);
         cJSON_AddItemToArray(arr, o);
@@ -1199,23 +1271,23 @@ bool os_ui_request_open_app(const char *query, char *matched_name, size_t name_l
     int bid = -1;
     const char *bname = NULL;
     if (ci_contains(query, "设置") || ci_contains(query, "setting") || ci_contains(query, "wifi") || ci_contains(query, "网络")) {
-        bid = 0; bname = "设置";
+        bid = 0; bname = TR("设置", "Settings");
     } else if (ci_contains(query, "文件") || ci_contains(query, "file") || ci_contains(query, "tf") || ci_contains(query, "sd")) {
-        bid = 1; bname = "文件管理";
-    } else if (ci_contains(query, "应用") || ci_contains(query, "商店") || ci_contains(query, "appstore") || ci_contains(query, "安装")) {
-        bid = 2; bname = "应用管理";
-    } else if (ci_contains(query, "时钟") || ci_contains(query, "番茄") || ci_contains(query, "闹钟") || ci_contains(query, "clock") || ci_contains(query, "timer")) {
-        bid = 3; bname = "时钟";
+        bid = 1; bname = TR("文件管理", "Files");
+    } else if (ci_contains(query, "应用") || ci_contains(query, "商店") || ci_contains(query, "appstore") || ci_contains(query, "apps") || ci_contains(query, "安装")) {
+        bid = 2; bname = TR("应用管理", "Apps");
+    } else if (ci_contains(query, "时钟") || ci_contains(query, "番茄") || ci_contains(query, "闹钟") || ci_contains(query, "clock") || ci_contains(query, "timer") || ci_contains(query, "alarm") || ci_contains(query, "pomodoro")) {
+        bid = 3; bname = TR("时钟", "Clock");
     } else if (ci_contains(query, "计算") || ci_contains(query, "calc")) {
-        bid = 4; bname = "计算器";
+        bid = 4; bname = TR("计算器", "Calculator");
     } else if (ci_contains(query, "后台") || ci_contains(query, "多任务") || ci_contains(query, "recent")) {
-        bid = 5; bname = "多任务管理";
-    } else if (ci_contains(query, "控制中心") || ci_contains(query, "控制")) {
-        bid = 6; bname = "控制中心";
+        bid = 5; bname = TR("多任务管理", "Recents");
+    } else if (ci_contains(query, "控制中心") || ci_contains(query, "控制") || ci_contains(query, "control")) {
+        bid = 6; bname = TR("控制中心", "Control Center");
     } else if (ci_contains(query, "音乐") || ci_contains(query, "歌") || ci_contains(query, "music")) {
-        bid = 7; bname = "G'lam 音乐";
+        bid = 7; bname = TR("G'lam 音乐", "G'lam Music");
     } else if (ci_contains(query, "小智") || ci_contains(query, "xiaozhi") || ci_contains(query, "语音助手")) {
-        bid = 8; bname = "小智 AI";
+        bid = 8; bname = TR("小智 AI", "XiaoZhi AI");
     }
 
     if (bid >= 0) {
@@ -1258,7 +1330,8 @@ bool os_ui_request_close_app(const char *query, char *result_msg, size_t msg_len
 {
     if (query && (ci_contains(query, "小智") || ci_contains(query, "xiaozhi"))) {
         if (result_msg && msg_len > 0) {
-            snprintf(result_msg, msg_len, "小智 AI 为系统最高权限常驻服务，不可关闭或删除");
+            snprintf(result_msg, msg_len, "%s", TR("小智 AI 为系统最高权限常驻服务，不可关闭或删除",
+                                                   "XiaoZhi AI is a protected system service"));
         }
         return false;
     }
@@ -1267,8 +1340,8 @@ bool os_ui_request_close_app(const char *query, char *result_msg, size_t msg_len
     s_pend_close_app = true;
     portEXIT_CRITICAL(&s_evt_mux);
     if (result_msg && msg_len > 0) {
-        if (query && query[0]) snprintf(result_msg, msg_len, "已请求关闭: %s", query);
-        else snprintf(result_msg, msg_len, "已关闭当前前台应用并返回桌面");
+        if (query && query[0]) snprintf(result_msg, msg_len, TR("已请求关闭: %s", "Closing: %s"), query);
+        else snprintf(result_msg, msg_len, "%s", TR("已关闭当前前台应用并返回桌面", "Closed app and returned Home"));
     }
     return true;
 }
@@ -1293,12 +1366,12 @@ bool os_ui_request_pomodoro(const char *action, int minutes, char *result_msg, s
 
     if (result_msg && msg_len > 0) {
         if (act_code == 1) {
-            if (minutes > 0) snprintf(result_msg, msg_len, "已启动 %d 分钟番茄专注计时", minutes);
-            else snprintf(result_msg, msg_len, "已启动番茄专注计时");
+            if (minutes > 0) snprintf(result_msg, msg_len, TR("已启动 %d 分钟番茄专注计时", "Started %d min Pomodoro"), minutes);
+            else snprintf(result_msg, msg_len, "%s", TR("已启动番茄专注计时", "Pomodoro started"));
         } else if (act_code == 2) {
-            snprintf(result_msg, msg_len, "已暂停番茄专注计时");
+            snprintf(result_msg, msg_len, "%s", TR("已暂停番茄专注计时", "Pomodoro paused"));
         } else {
-            snprintf(result_msg, msg_len, "已重置番茄专注计时");
+            snprintf(result_msg, msg_len, "%s", TR("已重置番茄专注计时", "Pomodoro reset"));
         }
     }
     return true;
@@ -1312,7 +1385,7 @@ static void evaluate_exit_policy_on_leave(os_view_t leaving_view, os_view_t next
         /* Standalone Music App: leave UI untouched, hide to background audio service */
         hub_player_hide_to_os();
         if (audio_is_playing() || audio_get_state() == BSP_AUDIO_STATE_PAUSED) {
-            bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", "G'lam 音乐", VIEW_MUSIC_APP);
+            bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", TR("G'lam 音乐", "G'lam Music"), VIEW_MUSIC_APP);
         } else {
             bg_task_remove_match(BG_KIND_MUSIC, "com.glam.music", VIEW_MUSIC_APP);
             bg_task_remove_match(BG_KIND_MUSIC, "com.swift.music", VIEW_MUSIC_APP);
@@ -1333,7 +1406,7 @@ static void evaluate_exit_policy_on_leave(os_view_t leaving_view, os_view_t next
         }
     } else if (leaving_view == VIEW_CLOCK) {
         if (s_pomo_running && s_pomo_sec > 0) {
-            bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", "番茄时钟", VIEW_CLOCK);
+            bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
         } else {
             bg_task_remove_match(BG_KIND_BUILTIN, "os.clock", VIEW_CLOCK);
         }
@@ -1350,7 +1423,7 @@ static void evaluate_exit_policy_on_leave(os_view_t leaving_view, os_view_t next
     } else if (leaving_view == VIEW_XIAOZHI) {
         /* XiaoZhi AI is a persistent highest-privilege system service: keep alive in recents */
         bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC,
-                         OS_SYSTEM_APP_XIAOZHI_ID, "小智 AI", VIEW_XIAOZHI);
+                         OS_SYSTEM_APP_XIAOZHI_ID, TR("小智 AI", "XiaoZhi AI"), VIEW_XIAOZHI);
     }
 }
 
@@ -1375,7 +1448,7 @@ static void bg_enforce_anti_lag_guard(void)
             ESP_LOGW(TAG, "Anti-lag guard freed %s (free PSRAM=%uKB, internal SRAM=%uKB)",
                      s_bg_tasks[i].id, (unsigned)free_psram_kb, (unsigned)free_sram_kb);
             bg_task_remove_at(i);
-            show_toast_internal("内存紧张，已自动释放挂起应用");
+            show_toast_internal(TR("内存紧张，已自动释放挂起应用", "Low RAM: cleared suspended app"));
             return;
         }
     }
@@ -1388,6 +1461,7 @@ static void sync_home_edit_toolbar(void);
 static void clear_body_view(os_view_t next_view)
 {
     close_os_wifi_modal();
+    close_clock_modal();
     os_xz_view_destroy();
     if (!s_island_is_xz || next_view == VIEW_XIAOZHI) {
         close_island_popup();
@@ -1414,11 +1488,16 @@ static void clear_body_view(os_view_t next_view)
     s_home_clock_lbl = NULL;
     memset(s_home_slot_objs, 0, sizeof(s_home_slot_objs));
     s_lbl_pomo = NULL;
+    s_lbl_pomo_sub = NULL;
     s_arc_pomo = NULL;
     s_lbl_pomo_state = NULL;
     s_lbl_pomo_btn = NULL;
+    s_btn_pomo_toggle = NULL;
     s_lbl_clk_hh = NULL;
     s_lbl_clk_mm = NULL;
+    s_lbl_clk_hdr = NULL;
+    s_btn_clk_alarm = NULL;
+    s_lbl_clk_alarm_btn = NULL;
     s_lbl_calc = NULL;
     s_lbl_calc_expr = NULL;
     s_settings_cont = NULL;
@@ -1492,7 +1571,7 @@ static void launch_music_standalone(void)
     close_bg_mgr_overlay(false);
     if (s_elf_host) lv_obj_add_flag(s_elf_host, LV_OBJ_FLAG_HIDDEN);
     clear_body_view(VIEW_MUSIC_APP);
-    bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", "G'lam 音乐", VIEW_MUSIC_APP);
+    bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", TR("G'lam 音乐", "G'lam Music"), VIEW_MUSIC_APP);
     hub_player_start_or_show();
     if (s_gesture_pill) lv_obj_move_foreground(s_gesture_pill);
     if (s_toast_lbl) lv_obj_move_foreground(s_toast_lbl);
@@ -1515,7 +1594,7 @@ static void launch_dynamic_app(int app_idx)
         if (!info.from_sdcard || !bsp_sdcard_is_mounted() ||
             stat(music_elf_path, &st) != 0) {
             show_home_view();
-            show_toast_internal("请先安装到 TF 卡");
+            show_toast_internal(TR("请先安装到 TF 卡", "Insert TF card first"));
             return;
         }
         launch_music_standalone();
@@ -1566,14 +1645,14 @@ static void launch_dynamic_app(int app_idx)
         snprintf(elf_path, sizeof(elf_path), "/sdcard/apps/%s/app.elf", info.id);
         ret = swift_elf_load_and_run_file(&s_active_elf, info.id, elf_path, target_root, err, sizeof(err));
     } else {
-        snprintf(err, sizeof(err), "请先安装到 TF 卡");
+        snprintf(err, sizeof(err), "%s", TR("请先安装到 TF 卡", "Insert TF card first"));
     }
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Launch %s failed: %s", info.id, err);
         if (s_elf_host) lv_obj_add_flag(s_elf_host, LV_OBJ_FLAG_HIDDEN);
         show_home_view();
-        show_toast_internal(err[0] ? err : "启动失败");
+        show_toast_internal(err[0] ? err : TR("启动失败", "Launch failed"));
     } else {
         snprintf(s_active_elf_name, sizeof(s_active_elf_name), "%s", info.name);
         s_active_elf_policy = (bg_policy_t)info.bg_policy;
@@ -1597,6 +1676,7 @@ static void on_elf_tile_click(lv_event_t *e)
 
 typedef struct {
     const char *name;
+    const char *name_en;
     const char *sym;
     uint32_t bg_hex;
 } builtin_meta_t;
@@ -1604,26 +1684,40 @@ typedef struct {
 #define BUILTIN_APP_COUNT 9
 
 static const builtin_meta_t k_builtin_meta[BUILTIN_APP_COUNT] = {
-    { "设置", LV_SYMBOL_SETTINGS,  0x64748BU }, /* 0 */
-    { "文件", LV_SYMBOL_DIRECTORY, 0x06B6D4U }, /* 1 */
-    { "应用", LV_SYMBOL_DOWNLOAD,  0x2E7CF6U }, /* 2 */
-    { "时钟", LV_SYMBOL_BELL,      0xF97316U }, /* 3 */
-    { "计算", LV_SYMBOL_EDIT,      0x0EA5E9U }, /* 4 */
-    { "后台", LV_SYMBOL_LIST,      0x10B981U }, /* 5 */
-    { "控制", LV_SYMBOL_EYE_OPEN,  0x8B5CF6U }, /* 6 */
-    { "音乐", LV_SYMBOL_AUDIO,     0xFF2D55U }, /* 7 */
-    { "小智", LV_SYMBOL_CHARGE,    0x14B8A6U }, /* 8 */
+    { "设置", "Settings", LV_SYMBOL_SETTINGS,  0x64748BU }, /* 0 */
+    { "文件", "Files",    LV_SYMBOL_DIRECTORY, 0x06B6D4U }, /* 1 */
+    { "应用", "Apps",     LV_SYMBOL_DOWNLOAD,  0x2E7CF6U }, /* 2 */
+    { "时钟", "Clock",    LV_SYMBOL_BELL,      0xF97316U }, /* 3 */
+    { "计算", "Calc",     LV_SYMBOL_EDIT,      0x0EA5E9U }, /* 4 */
+    { "后台", "Recents",  LV_SYMBOL_LIST,      0x10B981U }, /* 5 */
+    { "控制", "Control",  LV_SYMBOL_EYE_OPEN,  0x8B5CF6U }, /* 6 */
+    { "音乐", "Music",    LV_SYMBOL_AUDIO,     0xFF2D55U }, /* 7 */
+    { "小智", "XiaoZhi",  LV_SYMBOL_CHARGE,    0x14B8A6U }, /* 8 */
 };
+
+static inline const char *builtin_display_name(int id)
+{
+    if (id < 0 || id >= BUILTIN_APP_COUNT) return TR("应用", "App");
+    return os_i18n_is_en() ? k_builtin_meta[id].name_en : k_builtin_meta[id].name;
+}
 
 static void format_zh_date_wday(char *buf, size_t len)
 {
-    static const char *const k_wday[7] = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
+    static const char *const k_wday_zh[7] = { "周日", "周一", "周二", "周三", "周四", "周五", "周六" };
+    static const char *const k_wday_en[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const char *const k_mon_en[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     time_t now_tm = time(NULL);
     struct tm tm_info;
     localtime_r(&now_tm, &tm_info);
     if (tm_info.tm_year > (2020 - 1900)) {
-        snprintf(buf, len, "%d月%d日 %s",
-                 tm_info.tm_mon + 1, tm_info.tm_mday, k_wday[tm_info.tm_wday % 7]);
+        if (os_i18n_is_en()) {
+            snprintf(buf, len, "%s %d %s",
+                     k_mon_en[tm_info.tm_mon % 12], tm_info.tm_mday, k_wday_en[tm_info.tm_wday % 7]);
+        } else {
+            snprintf(buf, len, "%d月%d日 %s",
+                     tm_info.tm_mon + 1, tm_info.tm_mday, k_wday_zh[tm_info.tm_wday % 7]);
+        }
     } else {
         buf[0] = '\0';
     }
@@ -2025,7 +2119,7 @@ static void on_slot_pick_builtin(lv_event_t *e)
     int dst = (s_slot_modal_target >= 0) ? s_slot_modal_target : home_find_first_empty_slot(true);
     close_slot_modal();
     if (dst < 0 || dst >= HOME_TOTAL_SLOTS || bid < 0 || bid >= BUILTIN_APP_COUNT) {
-        show_toast_internal("桌面已满");
+        show_toast_internal(TR("桌面已满", "Home screen full"));
         return;
     }
     if (s_home_layout.slots[dst].kind == SLOT_WIDGET_CLOCK && dst + 1 < HOME_GRID_SLOTS) {
@@ -2044,7 +2138,7 @@ static void on_slot_pick_elf(lv_event_t *e)
     int dst = (s_slot_modal_target >= 0) ? s_slot_modal_target : home_find_first_empty_slot(true);
     close_slot_modal();
     if (dst < 0 || dst >= HOME_TOTAL_SLOTS || app_idx < 0 || app_idx >= s_app_count) {
-        show_toast_internal("桌面已满");
+        show_toast_internal(TR("桌面已满", "Home screen full"));
         return;
     }
     if (s_home_layout.slots[dst].kind == SLOT_WIDGET_CLOCK && dst + 1 < HOME_GRID_SLOTS) {
@@ -2079,7 +2173,7 @@ static void on_slot_pick_clock_widget(lv_event_t *e)
         dst = home_find_first_wide_pair();
     }
     if (dst < 0 || dst >= HOME_GRID_SLOTS || (dst % 4) == 3) {
-        show_toast_internal("需要2个相邻空位");
+        show_toast_internal(TR("需要2个相邻空位", "Need 2 adjacent slots"));
         return;
     }
     memset(&s_home_layout.slots[dst], 0, sizeof(home_slot_t));
@@ -2124,7 +2218,7 @@ static void on_slot_uninstall_elf_click(lv_event_t *e)
     memset(&s_home_layout.slots[dst], 0, sizeof(home_slot_t));
     save_home_layout();
     show_home_view();
-    show_toast_internal("已卸载");
+    show_toast_internal(TR("已卸载", "Uninstalled"));
 }
 
 static void open_slot_modify_modal(int target_slot)
@@ -2152,7 +2246,7 @@ static void open_slot_modify_modal(int target_slot)
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(card);
-    lv_label_set_text(hdr, (target_slot >= 0) ? "修改" : "添加");
+    lv_label_set_text(hdr, (target_slot >= 0) ? TR("修改", "Edit") : TR("添加", "Add"));
     lv_obj_set_pos(hdr, 4, 2);
     lv_obj_set_style_text_color(hdr, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(hdr, &ui_font_cjk_14, 0);
@@ -2201,7 +2295,7 @@ static void open_slot_modify_modal(int target_slot)
         lv_obj_set_style_text_font(ci, &lv_font_montserrat_14, 0);
         lv_obj_align(ci, LV_ALIGN_TOP_MID, 0, 8);
         lv_obj_t *cl = lv_label_create(bc);
-        lv_label_set_text(cl, "移除");
+        lv_label_set_text(cl, TR("移除", "Remove"));
         lv_obj_set_style_text_color(cl, lv_color_hex(0xFFFFFFU), 0);
         lv_obj_set_style_text_font(cl, &ui_font_cjk_14, 0);
         lv_obj_align(cl, LV_ALIGN_BOTTOM_MID, 0, -5);
@@ -2221,7 +2315,7 @@ static void open_slot_modify_modal(int target_slot)
             lv_obj_set_style_text_font(ui, &lv_font_montserrat_14, 0);
             lv_obj_align(ui, LV_ALIGN_TOP_MID, 0, 8);
             lv_obj_t *ul = lv_label_create(bu);
-            lv_label_set_text(ul, "卸载");
+            lv_label_set_text(ul, TR("卸载", "Delete"));
             lv_obj_set_style_text_color(ul, lv_color_hex(0xFFFFFFU), 0);
             lv_obj_set_style_text_font(ul, &ui_font_cjk_14, 0);
             lv_obj_align(ul, LV_ALIGN_BOTTOM_MID, 0, -5);
@@ -2245,7 +2339,7 @@ static void open_slot_modify_modal(int target_slot)
         lv_obj_set_style_text_font(wi, &lv_font_montserrat_14, 0);
         lv_obj_align(wi, LV_ALIGN_TOP_MID, 0, 8);
         lv_obj_t *wl = lv_label_create(bw);
-        lv_label_set_text(wl, "组件");
+        lv_label_set_text(wl, TR("组件", "Widget"));
         lv_obj_set_style_text_color(wl, lv_color_hex(th->text_pri), 0);
         lv_obj_set_style_text_font(wl, &ui_font_cjk_14, 0);
         lv_obj_align(wl, LV_ALIGN_BOTTOM_MID, 0, -5);
@@ -2278,7 +2372,7 @@ static void open_slot_modify_modal(int target_slot)
         lv_obj_center(si);
 
         lv_obj_t *bl = lv_label_create(btn);
-        lv_label_set_text(bl, k_builtin_meta[b].name);
+        lv_label_set_text(bl, builtin_display_name(b));
         lv_obj_set_style_text_color(bl, lv_color_hex(th->text_pri), 0);
         lv_obj_set_style_text_font(bl, &ui_font_cjk_14, 0);
         lv_obj_align(bl, LV_ALIGN_BOTTOM_MID, 0, -4);
@@ -2313,7 +2407,7 @@ static void open_slot_modify_modal(int target_slot)
 
         lv_obj_t *bl = lv_label_create(btn);
         lv_label_set_text(bl, s_apps[i].name);
-        lv_obj_set_width(bl, 54);
+        lv_obj_set_size(bl, 54, 18);
         lv_obj_set_style_text_align(bl, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(bl, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_color(bl, lv_color_hex(th->text_pri), 0);
@@ -2413,7 +2507,7 @@ static void create_drag_ghost_for_slot(int slot, lv_point_t pt)
         if (sl->kind == SLOT_BUILTIN && sl->builtin_id >= 0 && sl->builtin_id < BUILTIN_APP_COUNT) {
             sym = k_builtin_meta[sl->builtin_id].sym;
             bg = k_builtin_meta[sl->builtin_id].bg_hex;
-            title = k_builtin_meta[sl->builtin_id].name;
+            title = builtin_display_name(sl->builtin_id);
         } else if (sl->kind == SLOT_ELF_APP) {
             int idx = find_elf_app_index(sl->app_id);
             if (idx >= 0) {
@@ -2438,7 +2532,7 @@ static void create_drag_ghost_for_slot(int slot, lv_point_t pt)
 
         lv_obj_t *tl = lv_label_create(s_drag_ghost);
         lv_label_set_text(tl, title);
-        lv_obj_set_width(tl, 58);
+        lv_obj_set_size(tl, 58, 18);
         lv_obj_set_style_text_align(tl, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_long_mode(tl, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_color(tl, lv_color_hex(th->text_pri), 0);
@@ -2726,7 +2820,7 @@ static void build_home_grid_slot(lv_obj_t *page_obj, int slot_idx)
     const os_app_info_t *app_ptr = NULL;
 
     if (sl->kind == SLOT_BUILTIN && sl->builtin_id >= 0 && sl->builtin_id < BUILTIN_APP_COUNT) {
-        title = k_builtin_meta[sl->builtin_id].name;
+        title = builtin_display_name(sl->builtin_id);
         fallback_sym = k_builtin_meta[sl->builtin_id].sym;
         fallback_bg = k_builtin_meta[sl->builtin_id].bg_hex;
         if (sl->builtin_id == 7) {
@@ -2969,7 +3063,7 @@ static void show_xiaozhi_view(void)
     clear_body_view(VIEW_XIAOZHI);
     const os_theme_t *th = T();
     bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC,
-                     OS_SYSTEM_APP_XIAOZHI_ID, "小智 AI", VIEW_XIAOZHI);
+                     OS_SYSTEM_APP_XIAOZHI_ID, TR("小智 AI", "XiaoZhi AI"), VIEW_XIAOZHI);
     os_xz_theme_t xt = {
         .bg_top        = th->bg_top,
         .bg_bot        = th->bg_bot,
@@ -2998,7 +3092,7 @@ static void on_bri_slider(lv_event_t *e)
     bsp_display_brightness_set(v);
     if (s_lbl_bri) {
         char buf[24];
-        snprintf(buf, sizeof(buf), "亮度 %d%%", v);
+        snprintf(buf, sizeof(buf), TR("亮度 %d%%", "Bri %d%%"), v);
         lv_label_set_text(s_lbl_bri, buf);
     }
 }
@@ -3010,7 +3104,7 @@ static void on_vol_slider(lv_event_t *e)
     audio_set_volume((uint8_t)v);
     if (s_lbl_vol) {
         char buf[24];
-        snprintf(buf, sizeof(buf), "音量 %d%%", v);
+        snprintf(buf, sizeof(buf), TR("音量 %d%%", "Vol %d%%"), v);
         lv_label_set_text(s_lbl_vol, buf);
     }
 }
@@ -3025,8 +3119,30 @@ static void on_theme_pick(lv_event_t *e)
     apply_chrome_theme_styles();
     show_settings_view();
     char msg[48];
-    snprintf(msg, sizeof(msg), "主题已切换: %s", T()->name);
+    snprintf(msg, sizeof(msg), TR("主题已切换: %s", "Theme: %s"), theme_display_name(s_theme_idx));
     show_toast_internal(msg);
+}
+
+static void on_lang_pick(lv_event_t *e)
+{
+    os_lang_t lang = (os_lang_t)(uintptr_t)lv_event_get_user_data(e);
+    os_i18n_set_lang(lang);
+    if (s_lbl_home_btn) lv_label_set_text(s_lbl_home_btn, TR("桌面", "Home"));
+    if (s_lbl_edit_done) lv_label_set_text(s_lbl_edit_done, TR("完成", "Done"));
+    s_cache_hm_date[0] = '\0';
+    ui_manager_refresh_language();
+    for (int i = 0; i < MAX_BG_TASKS; i++) {
+        if (!s_bg_tasks[i].active) continue;
+        if (strcmp(s_bg_tasks[i].id, OS_SYSTEM_APP_XIAOZHI_ID) == 0) {
+            snprintf(s_bg_tasks[i].name, sizeof(s_bg_tasks[i].name), "%s", TR("小智 AI", "XiaoZhi AI"));
+        } else if (strcmp(s_bg_tasks[i].id, "com.glam.music") == 0) {
+            snprintf(s_bg_tasks[i].name, sizeof(s_bg_tasks[i].name), "%s", TR("G'lam 音乐", "G'lam Music"));
+        } else if (strcmp(s_bg_tasks[i].id, "os.clock") == 0) {
+            snprintf(s_bg_tasks[i].name, sizeof(s_bg_tasks[i].name), "%s", TR("番茄时钟", "Pomodoro"));
+        }
+    }
+    show_settings_view();
+    show_toast_internal(TR("语言已切换: 简体中文", "Language: English"));
 }
 
 static void on_reset_wall_click(lv_event_t *e)
@@ -3035,7 +3151,7 @@ static void on_reset_wall_click(lv_event_t *e)
     remove(CUSTOM_WALL_PATH);
     rebuild_wallpaper_buffer();
     show_settings_view();
-    show_toast_internal("已恢复默认流光壁纸");
+    show_toast_internal(TR("已恢复默认流光壁纸", "Default wallpaper restored"));
 }
 
 static lv_obj_t *create_flex_box(lv_obj_t *parent, lv_flex_flow_t flow, lv_coord_t pad_gap)
@@ -3062,11 +3178,11 @@ static void refresh_settings_wifi_card(void)
     const os_theme_t *th = T();
     char ip_msg[96];
     if (s_wifi_connected && s_wifi_ip[0]) {
-        snprintf(ip_msg, sizeof(ip_msg), "已连接: %s\n%s",
+        snprintf(ip_msg, sizeof(ip_msg), TR("已连接: %s\n%s", "Connected: %s\n%s"),
                  s_wifi_ssid[0] ? s_wifi_ssid : "Wi-Fi", s_wifi_ip);
         lv_obj_set_style_text_color(s_lbl_wifi_st, lv_color_hex(th->muted_ok), 0);
     } else {
-        snprintf(ip_msg, sizeof(ip_msg), "无线网络: 未连接\n点击配置 Wi-Fi");
+        snprintf(ip_msg, sizeof(ip_msg), "%s", TR("无线网络: 未连接\n点击配置 Wi-Fi", "Wi-Fi: Not connected\nTap to configure"));
         lv_obj_set_style_text_color(s_lbl_wifi_st, lv_color_hex(th->text_sec), 0);
     }
     lv_label_set_text(s_lbl_wifi_st, ip_msg);
@@ -3090,7 +3206,7 @@ static void on_wf_ssid_chip_click(lv_event_t *e)
     if (idx >= 0 && idx < 32 && s_scan_ssids[idx][0] && s_wf_ta_ssid) {
         lv_textarea_set_text(s_wf_ta_ssid, s_scan_ssids[idx]);
         if (s_wf_ta_pass) {
-            os_kbd24_open_locked(s_wf_ta_pass, "密码", 1, false, NULL, NULL);
+            os_kbd24_open_locked(s_wf_ta_pass, TR("密码", "Pass"), 1, false, NULL, NULL);
         }
     }
 }
@@ -3110,12 +3226,12 @@ static void os_wifi_scan_task_cb(void *arg)
                 char msg[64];
                 if (err == ESP_OK) {
                     if (count > 0) {
-                        snprintf(msg, sizeof(msg), "扫到 %d 个2.4G热点 · 上下滑动选择", count);
+                        snprintf(msg, sizeof(msg), TR("扫到 %d 个2.4G热点 · 上下滑动选择", "Found %d 2.4G networks · Scroll to pick"), count);
                     } else {
-                        snprintf(msg, sizeof(msg), "未扫到2.4G热点(请检查热点频段)");
+                        snprintf(msg, sizeof(msg), "%s", TR("未扫到2.4G热点(请检查热点频段)", "No 2.4G Wi-Fi found (check 2.4GHz band)"));
                     }
                 } else {
-                    snprintf(msg, sizeof(msg), "扫描失败，请重试");
+                    snprintf(msg, sizeof(msg), "%s", TR("扫描失败，请重试", "Scan failed, please retry"));
                 }
                 lv_label_set_text(s_wf_lbl_status, msg);
                 lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->text_sec), 0);
@@ -3124,7 +3240,8 @@ static void os_wifi_scan_task_cb(void *arg)
             lv_obj_clean(s_wf_ssid_row);
             if (err != ESP_OK || count <= 0) {
                 lv_obj_t *lbl = lv_label_create(s_wf_ssid_row);
-                lv_label_set_text(lbl, "暂未扫到2.4G网络，手机热点请开启“最大兼容性/2.4G”或点下方手动输入");
+                lv_label_set_text(lbl, TR("暂未扫到2.4G网络，手机热点请开启“最大兼容性/2.4G”或点下方手动输入",
+                                  "No 2.4G Wi-Fi found. Enable 2.4GHz/Compatibility on hotspot or enter manually below"));
                 lv_obj_set_width(lbl, 286);
                 lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
                 lv_obj_set_style_text_color(lbl, lv_color_hex(th->text_mut), 0);
@@ -3192,7 +3309,7 @@ static void on_wf_scan_click(lv_event_t *e)
     (void)e;
     const os_theme_t *th = T();
     if (s_wf_lbl_status) {
-        lv_label_set_text(s_wf_lbl_status, "正在扫描周边 Wi-Fi...");
+        lv_label_set_text(s_wf_lbl_status, TR("正在扫描周边 Wi-Fi...", "Scanning nearby Wi-Fi..."));
         lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->text_sec), 0);
     }
     start_os_wifi_scan();
@@ -3212,14 +3329,14 @@ static void on_wf_connect_click(lv_event_t *e)
     const char *pass = s_wf_ta_pass ? lv_textarea_get_text(s_wf_ta_pass) : "";
     if (!ssid || !ssid[0]) {
         if (s_wf_lbl_status) {
-            lv_label_set_text(s_wf_lbl_status, "请先选择或输入 Wi-Fi 名称");
+            lv_label_set_text(s_wf_lbl_status, TR("请先选择或输入 Wi-Fi 名称", "Select or enter Wi-Fi SSID first"));
             lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->accent), 0);
         }
         return;
     }
     s_wifi_connecting = true;
     if (s_wf_lbl_status) {
-        lv_label_set_text(s_wf_lbl_status, "正在保存并连接...");
+        lv_label_set_text(s_wf_lbl_status, TR("正在保存并连接...", "Saving & connecting..."));
         lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->text_sec), 0);
     }
     wifi_portal_connect(ssid, pass ? pass : "");
@@ -3230,9 +3347,9 @@ static void on_wf_ta_click(lv_event_t *e)
     lv_obj_t *ta = lv_event_get_target(e);
     if (!ta) return;
     if (ta == s_wf_ta_ssid) {
-        os_kbd24_open_locked(s_wf_ta_ssid, "WiFi名", 0, false, NULL, NULL);
+        os_kbd24_open_locked(s_wf_ta_ssid, TR("WiFi名", "SSID"), 0, false, NULL, NULL);
     } else if (ta == s_wf_ta_pass) {
-        os_kbd24_open_locked(s_wf_ta_pass, "密码", 1, false, NULL, NULL);
+        os_kbd24_open_locked(s_wf_ta_pass, TR("密码", "Pass"), 1, false, NULL, NULL);
     }
 }
 
@@ -3259,7 +3376,7 @@ static void open_os_wifi_modal(void)
     /* Title + [扫描] + [返回] */
     lv_obj_t *title = lv_label_create(s_wifi_modal);
     lv_obj_set_pos(title, 8, 7);
-    lv_label_set_text(title, "连接 Wi-Fi 网络");
+    lv_label_set_text(title, TR("连接 Wi-Fi 网络", "Wi-Fi Setup"));
     lv_obj_set_style_text_color(title, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(title, &ui_font_cjk_14, 0);
 
@@ -3275,7 +3392,7 @@ static void open_os_wifi_modal(void)
     lv_obj_add_event_cb(btn_scan, on_wf_scan_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l_sc = lv_label_create(btn_scan);
     lv_obj_center(l_sc);
-    lv_label_set_text(l_sc, "扫描");
+    lv_label_set_text(l_sc, TR("扫描", "Scan"));
     lv_obj_set_style_text_color(l_sc, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(l_sc, &ui_font_cjk_14, 0);
 
@@ -3291,20 +3408,20 @@ static void open_os_wifi_modal(void)
     lv_obj_add_event_cb(btn_cancel, on_wf_cancel_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l_cn = lv_label_create(btn_cancel);
     lv_obj_center(l_cn);
-    lv_label_set_text(l_cn, "返回");
+    lv_label_set_text(l_cn, TR("返回", "Back"));
     lv_obj_set_style_text_color(l_cn, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(l_cn, &ui_font_cjk_14, 0);
 
     /* Status line */
     s_wf_lbl_status = lv_label_create(s_wifi_modal);
     lv_obj_set_pos(s_wf_lbl_status, 8, 30);
-    lv_obj_set_width(s_wf_lbl_status, 304);
+    lv_obj_set_size(s_wf_lbl_status, 304, 18);
     char init_msg[112];
     if (s_wifi_connected && s_wifi_ip[0]) {
-        snprintf(init_msg, sizeof(init_msg), "已连接 %s (%s) · 扫2.4G中...", s_wifi_ssid, s_wifi_ip);
+        snprintf(init_msg, sizeof(init_msg), TR("已连接 %s (%s) · 扫2.4G中...", "Connected %s (%s) · Scanning..."), s_wifi_ssid, s_wifi_ip);
         lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->muted_ok), 0);
     } else {
-        snprintf(init_msg, sizeof(init_msg), "正在扫描2.4G Wi-Fi (手机热点请开兼容模式)");
+        snprintf(init_msg, sizeof(init_msg), "%s", TR("正在扫描2.4G Wi-Fi (手机热点请开兼容模式)", "Scanning 2.4GHz Wi-Fi..."));
         lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->text_sec), 0);
     }
     lv_label_set_text(s_wf_lbl_status, init_msg);
@@ -3329,7 +3446,7 @@ static void open_os_wifi_modal(void)
     lv_obj_set_style_radius(s_wf_ssid_row, 2, LV_PART_SCROLLBAR);
 
     lv_obj_t *scan_hint = lv_label_create(s_wf_ssid_row);
-    lv_label_set_text(scan_hint, "正在搜索附近 2.4G 无线网络...");
+    lv_label_set_text(scan_hint, TR("正在搜索附近 2.4G 无线网络...", "Searching nearby 2.4GHz networks..."));
     lv_obj_set_width(scan_hint, 286);
     lv_label_set_long_mode(scan_hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(scan_hint, lv_color_hex(th->text_mut), 0);
@@ -3340,7 +3457,7 @@ static void open_os_wifi_modal(void)
     lv_obj_set_pos(s_wf_ta_ssid, 8, 148);
     lv_obj_set_size(s_wf_ta_ssid, 304, 28);
     lv_textarea_set_one_line(s_wf_ta_ssid, true);
-    lv_textarea_set_placeholder_text(s_wf_ta_ssid, "点击输入 Wi-Fi 名称");
+    lv_textarea_set_placeholder_text(s_wf_ta_ssid, TR("点击输入 Wi-Fi 名称", "Tap to enter SSID"));
     style_recess_box(s_wf_ta_ssid, 8);
     lv_obj_set_style_pad_ver(s_wf_ta_ssid, 4, 0);
     lv_obj_set_style_pad_hor(s_wf_ta_ssid, 10, 0);
@@ -3359,7 +3476,7 @@ static void open_os_wifi_modal(void)
     lv_obj_set_pos(s_wf_ta_pass, 8, 179);
     lv_obj_set_size(s_wf_ta_pass, 304, 28);
     lv_textarea_set_one_line(s_wf_ta_pass, true);
-    lv_textarea_set_placeholder_text(s_wf_ta_pass, "点击输入 Wi-Fi 密码");
+    lv_textarea_set_placeholder_text(s_wf_ta_pass, TR("点击输入 Wi-Fi 密码", "Tap to enter password"));
     style_recess_box(s_wf_ta_pass, 8);
     lv_obj_set_style_pad_ver(s_wf_ta_pass, 4, 0);
     lv_obj_set_style_pad_hor(s_wf_ta_pass, 10, 0);
@@ -3378,7 +3495,7 @@ static void open_os_wifi_modal(void)
     lv_obj_add_event_cb(btn_conn, on_wf_connect_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l_co = lv_label_create(btn_conn);
     lv_obj_center(l_co);
-    lv_label_set_text(l_co, "保存连接");
+    lv_label_set_text(l_co, TR("保存连接", "Connect"));
     lv_obj_set_style_text_color(l_co, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(l_co, &ui_font_cjk_14, 0);
 
@@ -3502,12 +3619,12 @@ static void show_settings_view(void)
 
     int bri = bsp_display_brightness_get();
     char bbuf[24];
-    snprintf(bbuf, sizeof(bbuf), "亮度 %d%%", bri);
+    snprintf(bbuf, sizeof(bbuf), TR("亮度 %d%%", "Bri %d%%"), bri);
     s_lbl_bri = add_settings_slider_row(c_sl, bbuf, 10, 100, bri, th->text_sec, on_bri_slider, th);
 
     int vol = audio_get_volume();
     char vbuf[24];
-    snprintf(vbuf, sizeof(vbuf), "音量 %d%%", vol);
+    snprintf(vbuf, sizeof(vbuf), TR("音量 %d%%", "Vol %d%%"), vol);
     s_lbl_vol = add_settings_slider_row(c_sl, vbuf, 0, 100, vol, th->accent, on_vol_slider, th);
 
     /* Card 2: 3-Theme Hot Switcher (经典深色 / 初雪 / 深邃) */
@@ -3522,7 +3639,7 @@ static void show_settings_view(void)
     lv_obj_clear_flag(c_th, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lt = lv_label_create(c_th);
-    lv_label_set_text(lt, "主题");
+    lv_label_set_text(lt, TR("主题", "Theme"));
     lv_obj_set_style_text_color(lt, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(lt, &ui_font_cjk_14, 0);
 
@@ -3551,10 +3668,101 @@ static void show_settings_view(void)
         lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
         lv_obj_t *tl = lv_label_create(tb);
-        lv_label_set_text(tl, s_themes[i].name);
+        lv_label_set_text(tl, theme_display_name(i));
         lv_obj_set_style_text_color(tl, lv_color_hex(active ? th->text_pri : th->text_sec), 0);
         lv_obj_set_style_text_font(tl, &ui_font_cjk_14, 0);
     }
+
+    /* Card 2B: Language Hot Switcher (中文 / English) */
+    lv_obj_t *c_lg = lv_obj_create(s_settings_cont);
+    lv_obj_set_size(c_lg, LV_PCT(100), LV_SIZE_CONTENT);
+    style_bento_card(c_lg, 10, true);
+    lv_obj_set_style_pad_hor(c_lg, 8, 0);
+    lv_obj_set_style_pad_ver(c_lg, 6, 0);
+    lv_obj_set_style_pad_column(c_lg, 6, 0);
+    lv_obj_set_flex_flow(c_lg, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c_lg, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(c_lg, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *llg = lv_label_create(c_lg);
+    lv_label_set_text(llg, TR("语言", "Lang"));
+    lv_obj_set_style_text_color(llg, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(llg, &ui_font_cjk_14, 0);
+
+    static const char *const k_lang_lbl[2] = { "简体中文", "English" };
+    for (uint8_t i = 0; i < 2; i++) {
+        bool active = ((uint8_t)os_i18n_get_lang() == i);
+        lv_obj_t *lb = lv_btn_create(c_lg);
+        lv_obj_set_flex_grow(lb, 1);
+        lv_obj_set_height(lb, 28);
+        lv_obj_set_style_bg_color(lb, lv_color_hex(active ? th->accent_tint : th->recess_bg), 0);
+        lv_obj_set_style_border_width(lb, 1, 0);
+        lv_obj_set_style_border_color(lb, lv_color_hex(active ? th->accent : th->recess_border), 0);
+        lv_obj_set_style_radius(lb, 7, 0);
+        lv_obj_set_style_shadow_width(lb, 0, 0);
+        lv_obj_set_style_pad_all(lb, 0, 0);
+        lv_obj_add_event_cb(lb, on_lang_pick, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+
+        lv_obj_t *ll = lv_label_create(lb);
+        lv_label_set_text(ll, k_lang_lbl[i]);
+        lv_obj_set_style_text_color(ll, lv_color_hex(active ? th->text_pri : th->text_sec), 0);
+        lv_obj_set_style_text_font(ll, &ui_font_cjk_14, 0);
+        lv_obj_center(ll);
+    }
+
+    /* Card 2C: Date, Time & Alarm Quick Entry */
+    lv_obj_t *c_tm = lv_obj_create(s_settings_cont);
+    lv_obj_set_size(c_tm, LV_PCT(100), LV_SIZE_CONTENT);
+    style_bento_card(c_tm, 10, true);
+    lv_obj_set_style_pad_hor(c_tm, 8, 0);
+    lv_obj_set_style_pad_ver(c_tm, 6, 0);
+    lv_obj_set_style_pad_column(c_tm, 6, 0);
+    lv_obj_set_flex_flow(c_tm, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(c_tm, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(c_tm, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ltm = lv_label_create(c_tm);
+    lv_label_set_text(ltm, TR("时间", "Time"));
+    lv_obj_set_style_text_color(ltm, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(ltm, &ui_font_cjk_14, 0);
+
+    lv_obj_t *bt_set = lv_btn_create(c_tm);
+    lv_obj_set_flex_grow(bt_set, 1);
+    lv_obj_set_height(bt_set, 28);
+    lv_obj_set_style_bg_color(bt_set, lv_color_hex(th->accent_tint), 0);
+    lv_obj_set_style_border_width(bt_set, 1, 0);
+    lv_obj_set_style_border_color(bt_set, lv_color_hex(th->accent_border), 0);
+    lv_obj_set_style_radius(bt_set, 7, 0);
+    lv_obj_set_style_shadow_width(bt_set, 0, 0);
+    lv_obj_set_style_pad_all(bt_set, 0, 0);
+    lv_obj_add_event_cb(bt_set, on_open_sys_time_click, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lts = lv_label_create(bt_set);
+    lv_label_set_text(lts, TR("手动校时", "Set Time"));
+    lv_obj_set_style_text_color(lts, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_text_font(lts, &ui_font_cjk_14, 0);
+    lv_obj_center(lts);
+
+    lv_obj_t *bt_al = lv_btn_create(c_tm);
+    lv_obj_set_flex_grow(bt_al, 1);
+    lv_obj_set_height(bt_al, 28);
+    lv_obj_set_style_bg_color(bt_al, lv_color_hex(s_alarm_enabled ? th->accent_tint : th->recess_bg), 0);
+    lv_obj_set_style_border_width(bt_al, 1, 0);
+    lv_obj_set_style_border_color(bt_al, lv_color_hex(s_alarm_enabled ? th->accent : th->recess_border), 0);
+    lv_obj_set_style_radius(bt_al, 7, 0);
+    lv_obj_set_style_shadow_width(bt_al, 0, 0);
+    lv_obj_set_style_pad_all(bt_al, 0, 0);
+    lv_obj_add_event_cb(bt_al, on_open_alarm_set_click, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lta = lv_label_create(bt_al);
+    if (s_alarm_enabled) {
+        char ab[20];
+        snprintf(ab, sizeof(ab), LV_SYMBOL_BELL " %02u:%02u", (unsigned)s_alarm_hour, (unsigned)s_alarm_min);
+        lv_label_set_text(lta, ab);
+    } else {
+        lv_label_set_text(lta, TR("定时闹钟", "Alarm"));
+    }
+    lv_obj_set_style_text_color(lta, lv_color_hex(s_alarm_enabled ? th->accent : th->text_sec), 0);
+    lv_obj_set_style_text_font(lta, &ui_font_cjk_14, 0);
+    lv_obj_center(lta);
 
     /* Card 3: Wi-Fi Setup (Opens Full-Screen Wi-Fi Portal + 24-Key Keyboard) */
     lv_obj_t *c_wf = lv_obj_create(s_settings_cont);
@@ -3598,7 +3806,7 @@ static void show_settings_view(void)
     lv_obj_set_style_pad_all(btn_cfg, 0, 0);
     lv_obj_add_event_cb(btn_cfg, on_open_wifi_modal_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lw = lv_label_create(btn_cfg);
-    lv_label_set_text(lw, "配置网络");
+    lv_label_set_text(lw, TR("配置网络", "Wi-Fi"));
     lv_obj_set_style_text_color(lw, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(lw, &ui_font_cjk_14, 0);
     lv_obj_center(lw);
@@ -3617,8 +3825,8 @@ static void show_settings_view(void)
     uint32_t f_sram = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U);
 
     char pbuf[28], sbuf[28];
-    snprintf(pbuf, sizeof(pbuf), "扩展内存 %uK", (unsigned)f_psram);
-    snprintf(sbuf, sizeof(sbuf), "高速缓存 %uK", (unsigned)f_sram);
+    snprintf(pbuf, sizeof(pbuf), TR("扩展内存 %uK", "PSRAM %uK"), (unsigned)f_psram);
+    snprintf(sbuf, sizeof(sbuf), TR("高速缓存 %uK", "SRAM %uK"), (unsigned)f_sram);
 
     add_settings_mem_col(c_mem, pbuf, (int32_t)TOTAL_PSRAM_KB, (int32_t)f_psram, th->accent, th,
                          &s_lbl_set_psram, &s_bar_set_psram);
@@ -3636,7 +3844,9 @@ static void show_settings_view(void)
     lv_obj_clear_flag(c_wp, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lw_st = lv_label_create(c_wp);
-    lv_label_set_text(lw_st, s_has_custom_wall ? "壁纸: 自定义图片 (已模糊)" : "壁纸: 系统流光模糊壁纸");
+    lv_label_set_text(lw_st, s_has_custom_wall
+                             ? TR("壁纸: 自定义图片 (已模糊)", "Wall: Custom (Blurred)")
+                             : TR("壁纸: 系统流光模糊壁纸", "Wall: System Aurora"));
     lv_obj_set_style_text_color(lw_st, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(lw_st, &ui_font_cjk_14, 0);
 
@@ -3650,7 +3860,7 @@ static void show_settings_view(void)
         lv_obj_set_style_shadow_width(b_rw, 0, 0);
         lv_obj_add_event_cb(b_rw, on_reset_wall_click, LV_EVENT_CLICKED, NULL);
         lv_obj_t *lrw = lv_label_create(b_rw);
-        lv_label_set_text(lrw, "恢复流光壁纸");
+        lv_label_set_text(lrw, TR("恢复流光壁纸", "Reset Wall"));
         lv_obj_set_style_text_color(lrw, lv_color_hex(th->accent), 0);
         lv_obj_set_style_text_font(lrw, &ui_font_cjk_14, 0);
         lv_obj_center(lrw);
@@ -3685,7 +3895,7 @@ static void on_set_wallpaper_click(lv_event_t *e)
 {
     (void)e;
     if (!s_preview_img_path[0] || !bsp_sdcard_is_mounted()) {
-        show_toast_internal("无法设置壁纸");
+        show_toast_internal(TR("无法设置壁纸", "Cannot set wallpaper"));
         return;
     }
     if (strcmp(s_preview_img_path, CUSTOM_WALL_PATH) != 0) {
@@ -3694,7 +3904,7 @@ static void on_set_wallpaper_click(lv_event_t *e)
         if (!src || !dst) {
             if (src) fclose(src);
             if (dst) fclose(dst);
-            show_toast_internal("写入壁纸文件失败");
+            show_toast_internal(TR("写入壁纸文件失败", "Failed to save wallpaper"));
             return;
         }
         uint8_t buf[1024];
@@ -3706,7 +3916,7 @@ static void on_set_wallpaper_click(lv_event_t *e)
         fclose(dst);
     }
     rebuild_wallpaper_buffer();
-    show_toast_internal("已设为高斯模糊桌面壁纸");
+    show_toast_internal(TR("已设为高斯模糊桌面壁纸", "Wallpaper applied"));
 }
 
 static void show_image_preview(const char *full_path, const char *filename)
@@ -3714,7 +3924,7 @@ static void show_image_preview(const char *full_path, const char *filename)
     snprintf(s_preview_img_path, sizeof(s_preview_img_path), "%s", full_path ? full_path : "");
     FILE *f = fopen(full_path, "rb");
     if (!f) {
-        show_toast_internal("无法打开图片文件");
+        show_toast_internal(TR("无法打开图片文件", "Cannot open image"));
         return;
     }
     fseek(f, 0, SEEK_END);
@@ -3723,14 +3933,14 @@ static void show_image_preview(const char *full_path, const char *filename)
 
     if (sz <= 16 || sz > 2 * 1024 * 1024) {
         fclose(f);
-        show_toast_internal(sz > 2 * 1024 * 1024 ? "图片超过 2MB，无法加载" : "无效的图片文件");
+        show_toast_internal(sz > 2 * 1024 * 1024 ? TR("图片超过 2MB，无法加载", "Image > 2MB too large") : TR("无效的图片文件", "Invalid image file"));
         return;
     }
 
     uint8_t *jpg_buf = (uint8_t *)heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!jpg_buf) {
         fclose(f);
-        show_toast_internal("内存不足，无法加载图片");
+        show_toast_internal(TR("内存不足，无法加载图片", "Out of RAM for image"));
         return;
     }
 
@@ -3742,7 +3952,7 @@ static void show_image_preview(const char *full_path, const char *filename)
     if (got != (size_t)sz ||
         cover_decode_jpeg_fit(jpg_buf, got, 308, 174, &new_dsc, &new_fb) != ESP_OK) {
         heap_caps_free(jpg_buf);
-        show_toast_internal("不支持的图片格式(需标准JPEG)");
+        show_toast_internal(TR("不支持的图片格式(需标准JPEG)", "Unsupported format (need JPEG)"));
         return;
     }
     heap_caps_free(jpg_buf);
@@ -3763,9 +3973,9 @@ static void show_image_preview(const char *full_path, const char *filename)
     lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(bg);
-    lv_label_set_text(hdr, filename ? filename : "图片预览");
+    lv_label_set_text(hdr, filename ? filename : TR("图片预览", "Image Preview"));
     lv_obj_set_pos(hdr, 8, 6);
-    lv_obj_set_width(hdr, 152);
+    lv_obj_set_size(hdr, 152, 18);
     lv_label_set_long_mode(hdr, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(hdr, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(hdr, &ui_font_cjk_14, 0);
@@ -3776,7 +3986,7 @@ static void show_image_preview(const char *full_path, const char *filename)
     style_tactile_btn(btn_wall, th->accent, shift_rgb(th->accent, -40), 8);
     lv_obj_add_event_cb(btn_wall, on_set_wallpaper_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lw = lv_label_create(btn_wall);
-    lv_label_set_text(lw, "设为壁纸");
+    lv_label_set_text(lw, TR("设为壁纸", "Wallpaper"));
     lv_obj_set_style_text_color(lw, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(lw, &ui_font_cjk_14, 0);
     lv_obj_center(lw);
@@ -3787,7 +3997,7 @@ static void show_image_preview(const char *full_path, const char *filename)
     style_tactile_btn(btn_back, th->card_top, th->lip_shadow, 8);
     lv_obj_add_event_cb(btn_back, on_img_back_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lb = lv_label_create(btn_back);
-    lv_label_set_text(lb, "返回");
+    lv_label_set_text(lb, TR("返回", "Back"));
     lv_obj_set_style_text_color(lb, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(lb, &ui_font_cjk_14, 0);
     lv_obj_center(lb);
@@ -3827,7 +4037,7 @@ static void on_fm_item_click(lv_event_t *e)
     } else if (ends_with_ci(s_fm_items[idx].name, ".gla") || ends_with_ci(s_fm_items[idx].name, ".spk")) {
         FILE *f = fopen(full, "rb");
         if (!f) {
-            show_toast_internal("无法打开安装包");
+            show_toast_internal(TR("无法打开安装包", "Cannot open package"));
             return;
         }
         fseek(f, 0, SEEK_END);
@@ -3840,19 +4050,19 @@ static void on_fm_item_click(lv_event_t *e)
             if (got == (size_t)sz &&
                 os_installer_install_spk_buffer(buf, got, id, sizeof(id), err, sizeof(err)) == ESP_OK) {
                 char msg[96];
-                snprintf(msg, sizeof(msg), "安装成功: %s", id);
+                snprintf(msg, sizeof(msg), TR("安装成功: %s", "Installed: %s"), id);
                 show_toast_internal(msg);
             } else {
-                show_toast_internal(err[0] ? err : "安装失败");
+                show_toast_internal(err[0] ? err : TR("安装失败", "Install failed"));
             }
             heap_caps_free(buf);
         }
         fclose(f);
     } else if (ends_with_ci(s_fm_items[idx].name, ".mp3") || ends_with_ci(s_fm_items[idx].name, ".wav")) {
         if (audio_play_file(full) == ESP_OK) {
-            show_toast_internal("开始播放音频");
+            show_toast_internal(TR("开始播放音频", "Playing audio"));
         } else {
-            show_toast_internal("音频播放失败");
+            show_toast_internal(TR("音频播放失败", "Audio play failed"));
         }
     } else if (ends_with_ci(s_fm_items[idx].name, ".jpg") || ends_with_ci(s_fm_items[idx].name, ".jpeg")) {
         show_image_preview(full, s_fm_items[idx].name);
@@ -3927,15 +4137,15 @@ static void show_files_view(void)
     lv_obj_clear_flag(hdr_bar, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *hdr = lv_label_create(hdr_bar);
-    lv_label_set_text(hdr, bsp_sdcard_is_mounted() ? s_fm_dir : "存储卡未插入 (/sdcard)");
+    lv_label_set_text(hdr, bsp_sdcard_is_mounted() ? s_fm_dir : TR("存储卡未插入 (/sdcard)", "No SD Card (/sdcard)"));
     lv_obj_set_pos(hdr, 8, 5);
-    lv_obj_set_width(hdr, 210);
+    lv_obj_set_size(hdr, 210, 18);
     lv_label_set_long_mode(hdr, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(hdr, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(hdr, &ui_font_cjk_14, 0);
 
     lv_obj_t *st_lbl = lv_label_create(hdr_bar);
-    lv_label_set_text(st_lbl, bsp_sdcard_is_mounted() ? "存储卡就绪" : "未插卡");
+    lv_label_set_text(st_lbl, bsp_sdcard_is_mounted() ? TR("存储卡就绪", "SD Ready") : TR("未插卡", "No SD"));
     lv_obj_align(st_lbl, LV_ALIGN_RIGHT_MID, -8, 0);
     lv_obj_set_style_text_color(st_lbl, lv_color_hex(bsp_sdcard_is_mounted() ? th->muted_ok : th->accent), 0);
     lv_obj_set_style_text_font(st_lbl, &ui_font_cjk_14, 0);
@@ -3951,14 +4161,14 @@ static void show_files_view(void)
 
     if (!bsp_sdcard_is_mounted()) {
         lv_obj_t *emp = lv_label_create(list);
-        lv_label_set_text(emp, "请插入存储卡后重试");
+        lv_label_set_text(emp, TR("请插入存储卡后重试", "Insert SD card and retry"));
         lv_obj_set_style_text_color(emp, lv_color_hex(th->text_sec), 0);
         lv_obj_set_style_text_font(emp, &ui_font_cjk_14, 0);
         return;
     }
 
     if (strcmp(s_fm_dir, "/sdcard") != 0) {
-        add_fm_row_card(list, "上级", false, ".. 返回上一级", "", -1);
+        add_fm_row_card(list, TR("上级", "UP"), false, TR(".. 返回上一级", ".. Parent Dir"), "", -1);
     }
 
     s_fm_count = 0;
@@ -3980,22 +4190,22 @@ static void show_files_view(void)
             s_fm_items[s_fm_count].is_dir = is_dir;
             s_fm_items[s_fm_count].size_bytes = fsz;
 
-            const char *badge = "文件";
+            const char *badge = TR("文件", "FILE");
             bool hl = false;
             if (is_dir) {
-                badge = "目录";
+                badge = TR("目录", "DIR");
             } else if (ends_with_ci(e->d_name, ".gla") || ends_with_ci(e->d_name, ".spk")) {
-                badge = "安装";
+                badge = TR("安装", "PKG");
                 hl = true;
             } else if (ends_with_ci(e->d_name, ".mp3") || ends_with_ci(e->d_name, ".wav")) {
-                badge = "音频";
+                badge = TR("音频", "AUD");
             } else if (ends_with_ci(e->d_name, ".jpg") || ends_with_ci(e->d_name, ".jpeg")) {
-                badge = "图片";
+                badge = TR("图片", "IMG");
             }
 
             char sub[20] = {0};
             if (is_dir) {
-                snprintf(sub, sizeof(sub), "文件夹");
+                snprintf(sub, sizeof(sub), "%s", TR("文件夹", "Folder"));
             } else if (fsz >= 1024U * 1024U) {
                 snprintf(sub, sizeof(sub), "%u.%uM", (unsigned)(fsz / (1024U * 1024U)),
                          (unsigned)((fsz % (1024U * 1024U)) * 10U / (1024U * 1024U)));
@@ -4020,7 +4230,7 @@ static void on_scan_install_click(lv_event_t *e)
     (void)e;
     int n = os_installer_scan_sd_install_dir();
     if (n == 0) {
-        show_toast_internal("/sdcard/install 无新安装包");
+        show_toast_internal(TR("/sdcard/install 无新安装包", "No new packages in /sdcard/install"));
     }
     show_appstore_view();
 }
@@ -4030,7 +4240,7 @@ static void on_uninstall_click(lv_event_t *e)
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
     if (idx >= 0 && idx < s_app_count) {
         if (!s_apps[idx].removable || s_apps[idx].is_system_app) {
-            show_toast_internal("系统最高权限应用不可卸载");
+            show_toast_internal(TR("系统最高权限应用不可卸载", "Protected system app cannot be removed"));
             return;
         }
         if (s_apps[idx].from_sdcard) {
@@ -4063,14 +4273,14 @@ static void show_appstore_view(void)
 
     char info[96];
     if (s_wifi_connected && s_wifi_ip[0]) {
-        snprintf(info, sizeof(info), "无线传包: http://%s/", s_wifi_ip);
+        snprintf(info, sizeof(info), TR("无线传包: http://%s/", "Web Install: http://%s/"), s_wifi_ip);
     } else {
-        snprintf(info, sizeof(info), "传包渠道: 卡内导入 / 数据线 / 无线");
+        snprintf(info, sizeof(info), "%s", TR("传包渠道: 卡内导入 / 数据线 / 无线", "Install via: SD / USB / Wi-Fi"));
     }
     lv_obj_t *lbl = lv_label_create(bar);
     lv_label_set_text(lbl, info);
     lv_obj_set_pos(lbl, 8, 6);
-    lv_obj_set_width(lbl, 196);
+    lv_obj_set_size(lbl, 196, 18);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(lbl, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(lbl, &ui_font_cjk_14, 0);
@@ -4084,7 +4294,7 @@ static void show_appstore_view(void)
     lv_obj_set_style_pad_all(btn_scan, 0, 0);
     lv_obj_add_event_cb(btn_scan, on_scan_install_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *ls = lv_label_create(btn_scan);
-    lv_label_set_text(ls, "扫描安装包");
+    lv_label_set_text(ls, TR("扫描安装包", "Scan SD"));
     lv_obj_set_style_text_color(ls, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(ls, &ui_font_cjk_14, 0);
     lv_obj_center(ls);
@@ -4101,7 +4311,8 @@ static void show_appstore_view(void)
     s_app_count = os_installer_list_apps(s_apps, OS_MAX_APPS);
     if (s_app_count == 0) {
         lv_obj_t *empty = lv_label_create(list);
-        lv_label_set_text(empty, "TF卡暂无已安装应用\n请放入 /sdcard/install/*.gla 后点扫描，或用数据线/Wi-Fi安装");
+        lv_label_set_text(empty, TR("TF卡暂无已安装应用\n请放入 /sdcard/install/*.gla 后点扫描，或用数据线/Wi-Fi安装",
+                                    "No user apps installed.\nPut .gla files in /sdcard/install/ and tap Scan, or install via USB/Wi-Fi."));
         lv_obj_set_width(empty, 286);
         lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(empty, lv_color_hex(th->text_sec), 0);
@@ -4134,12 +4345,12 @@ static void show_appstore_view(void)
 
         char sub[64];
         if (s_apps[i].is_system_app) {
-            snprintf(sub, sizeof(sub), "系统最高权限 · 不可卸载");
+            snprintf(sub, sizeof(sub), "%s", TR("系统最高权限 · 不可卸载", "System Core · Protected"));
         } else {
-            snprintf(sub, sizeof(sub), "版本%.10s · %uK · %s",
+            snprintf(sub, sizeof(sub), TR("版本%.10s · %uK · %s", "v%.10s · %uK · %s"),
                      s_apps[i].version,
                      (unsigned)((s_apps[i].elf_size + 1023U) / 1024U),
-                     s_app_icon_cache[i].valid ? "自带图标" : "默认图标");
+                     s_app_icon_cache[i].valid ? TR("自带图标", "Icon") : TR("默认图标", "Default"));
         }
         lv_obj_t *lm = lv_label_create(card);
         lv_label_set_text(lm, sub);
@@ -4161,7 +4372,7 @@ static void show_appstore_view(void)
         lv_obj_set_style_pad_all(b_run, 0, 0);
         lv_obj_add_event_cb(b_run, on_elf_tile_click, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         lv_obj_t *lr = lv_label_create(b_run);
-        lv_label_set_text(lr, "启动");
+        lv_label_set_text(lr, TR("启动", "Open"));
         lv_obj_set_style_text_color(lr, lv_color_hex(0xFFFFFFU), 0);
         lv_obj_set_style_text_font(lr, &ui_font_cjk_14, 0);
         lv_obj_center(lr);
@@ -4178,7 +4389,7 @@ static void show_appstore_view(void)
             lv_obj_set_style_pad_all(bu, 0, 0);
             lv_obj_add_event_cb(bu, on_uninstall_click, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
             lv_obj_t *lu = lv_label_create(bu);
-            lv_label_set_text(lu, "卸载");
+            lv_label_set_text(lu, TR("卸载", "Del"));
             lv_obj_set_style_text_color(lu, lv_color_hex(th->accent), 0);
             lv_obj_set_style_text_font(lu, &ui_font_cjk_14, 0);
             lv_obj_center(lu);
@@ -4188,8 +4399,73 @@ static void show_appstore_view(void)
 }
 
 /* ========================================================================= */
-/*                          Built-in App: Clock                              */
+/*                 Built-in App: Clock / Pomodoro / Alarm                    */
 /* ========================================================================= */
+
+static int s_ed_pomo_min = 25;
+static int s_ed_pomo_sec = 0;
+static lv_obj_t *s_ed_lbl_pmin = NULL;
+static lv_obj_t *s_ed_lbl_psec = NULL;
+
+static int s_ed_clk_hh = 12;
+static int s_ed_clk_mm = 0;
+static int s_ed_clk_yr = 2026;
+static int s_ed_clk_mo = 11;
+static int s_ed_clk_dy = 23;
+static lv_obj_t *s_ed_lbl_hh = NULL;
+static lv_obj_t *s_ed_lbl_mm = NULL;
+static lv_obj_t *s_ed_lbl_yr = NULL;
+static lv_obj_t *s_ed_lbl_mo = NULL;
+static lv_obj_t *s_ed_lbl_dy = NULL;
+
+static int s_ed_al_hh = 7;
+static int s_ed_al_mm = 30;
+static bool s_ed_al_en = false;
+static lv_obj_t *s_ed_lbl_al_hh = NULL;
+static lv_obj_t *s_ed_lbl_al_mm = NULL;
+static lv_obj_t *s_ed_lbl_al_st = NULL;
+
+static int days_in_month(int yr, int mo)
+{
+    static const int k_md[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (mo < 1 || mo > 12) return 30;
+    int d = k_md[mo - 1];
+    if (mo == 2 && ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0))) d = 29;
+    return d;
+}
+
+static void format_pomo_total_str(char *buf, size_t len)
+{
+    int m = s_pomo_total_sec / 60;
+    int s = s_pomo_total_sec % 60;
+    if (os_i18n_is_en()) {
+        if (m > 0 && s > 0) snprintf(buf, len, "%dm%02ds", m, s);
+        else if (m > 0) snprintf(buf, len, "Total %dm", m);
+        else snprintf(buf, len, "Total %ds", s);
+    } else {
+        if (m > 0 && s > 0) snprintf(buf, len, "共%d分%02d秒", m, s);
+        else if (m > 0) snprintf(buf, len, "共%d分钟", m);
+        else snprintf(buf, len, "共%d秒", s);
+    }
+}
+
+static void close_clock_modal(void)
+{
+    if (s_clock_modal) {
+        lv_obj_del(s_clock_modal);
+        s_clock_modal = NULL;
+    }
+    s_ed_lbl_pmin = NULL;
+    s_ed_lbl_psec = NULL;
+    s_ed_lbl_hh = NULL;
+    s_ed_lbl_mm = NULL;
+    s_ed_lbl_yr = NULL;
+    s_ed_lbl_mo = NULL;
+    s_ed_lbl_dy = NULL;
+    s_ed_lbl_al_hh = NULL;
+    s_ed_lbl_al_mm = NULL;
+    s_ed_lbl_al_st = NULL;
+}
 
 static void refresh_pomo_widgets(void)
 {
@@ -4199,39 +4475,927 @@ static void refresh_pomo_widgets(void)
         snprintf(pbuf, sizeof(pbuf), "%02d:%02d", s_pomo_sec / 60, s_pomo_sec % 60);
         lv_label_set_text(s_lbl_pomo, pbuf);
     }
+    if (s_lbl_pomo_sub) {
+        char sbuf[24];
+        format_pomo_total_str(sbuf, sizeof(sbuf));
+        lv_label_set_text(s_lbl_pomo_sub, sbuf);
+    }
     if (s_arc_pomo) {
-        lv_arc_set_value(s_arc_pomo, s_pomo_sec);
+        int rng = (s_pomo_total_sec > 0) ? s_pomo_total_sec : 60;
+        lv_arc_set_range(s_arc_pomo, 0, rng);
+        lv_arc_set_value(s_arc_pomo, s_pomo_sec > rng ? rng : s_pomo_sec);
     }
     if (s_lbl_pomo_state) {
-        lv_label_set_text(s_lbl_pomo_state, s_pomo_running ? "计时运行中" : "后台计时待命");
-        lv_obj_set_style_text_color(s_lbl_pomo_state,
-                                    lv_color_hex(s_pomo_running ? th->muted_ok : th->text_sec), 0);
+        if (s_alarm_ring_mode != 0) {
+            lv_label_set_text(s_lbl_pomo_state, TR("响铃提醒中!", "Ringing!"));
+            lv_obj_set_style_text_color(s_lbl_pomo_state, lv_color_hex(0xEF4444U), 0);
+        } else {
+            lv_label_set_text(s_lbl_pomo_state,
+                              s_pomo_running ? TR("计时运行中", "Running") : TR("点击设时/开始", "Ready"));
+            lv_obj_set_style_text_color(s_lbl_pomo_state,
+                                        lv_color_hex(s_pomo_running ? th->muted_ok : th->text_sec), 0);
+        }
+    }
+    if (s_btn_pomo_toggle) {
+        uint32_t bg_c = (s_alarm_ring_mode != 0) ? 0xEF4444U : th->accent;
+        style_tactile_btn(s_btn_pomo_toggle, bg_c, shift_rgb(bg_c, -45), 10);
     }
     if (s_lbl_pomo_btn) {
-        lv_label_set_text(s_lbl_pomo_btn, s_pomo_running ? "暂停专注" : "开始专注");
+        if (s_alarm_ring_mode != 0) {
+            lv_label_set_text(s_lbl_pomo_btn, TR("停止闹铃", "Stop Alarm"));
+        } else {
+            lv_label_set_text(s_lbl_pomo_btn, s_pomo_running ? TR("暂停专注", "Pause") : TR("开始专注", "Start"));
+        }
+    }
+    if (s_lbl_clk_hdr) {
+        if (s_alarm_enabled) {
+            char abuf[24];
+            snprintf(abuf, sizeof(abuf), LV_SYMBOL_BELL " %02u:%02u",
+                     (unsigned)s_alarm_hour, (unsigned)s_alarm_min);
+            lv_label_set_text(s_lbl_clk_hdr, abuf);
+            lv_obj_set_style_text_color(s_lbl_clk_hdr, lv_color_hex(th->accent), 0);
+        } else {
+            lv_label_set_text(s_lbl_clk_hdr, TR("当前时间", "Clock"));
+            lv_obj_set_style_text_color(s_lbl_clk_hdr, lv_color_hex(th->text_sec), 0);
+        }
+    }
+    if (s_btn_clk_alarm && s_lbl_clk_alarm_btn) {
+        if (s_alarm_enabled) {
+            lv_obj_set_style_border_width(s_btn_clk_alarm, 1, 0);
+            lv_obj_set_style_border_color(s_btn_clk_alarm, lv_color_hex(th->accent), 0);
+            lv_obj_set_style_bg_color(s_btn_clk_alarm, lv_color_hex(th->accent_tint), 0);
+            lv_obj_set_style_text_color(s_lbl_clk_alarm_btn, lv_color_hex(th->accent), 0);
+        } else {
+            style_tactile_btn(s_btn_clk_alarm, th->card_top, th->lip_shadow, 10);
+            lv_obj_set_style_text_color(s_lbl_clk_alarm_btn, lv_color_hex(th->text_pri), 0);
+        }
     }
 }
+
+static void stop_alarm_ring(void)
+{
+    bsp_audio_alarm_stop();
+    if (s_alarm_overlay) {
+        lv_obj_del(s_alarm_overlay);
+        s_alarm_overlay = NULL;
+    }
+    uint8_t prev = s_alarm_ring_mode;
+    s_alarm_ring_mode = 0;
+    if (prev == 1 && s_pomo_sec <= 0) {
+        s_pomo_sec = s_pomo_total_sec;
+    }
+    if (s_cur_view == VIEW_CLOCK) {
+        refresh_pomo_widgets();
+    }
+    if (s_cc_overlay) {
+        refresh_cc_tiles();
+    }
+    refresh_dynamic_island();
+}
+
+static void on_alarm_stop_click(lv_event_t *e)
+{
+    (void)e;
+    stop_alarm_ring();
+    show_toast_internal(TR("已关闭闹铃", "Alarm stopped"));
+}
+
+static void on_alarm_snooze_click(lv_event_t *e)
+{
+    (void)e;
+    uint8_t mode = s_alarm_ring_mode;
+    stop_alarm_ring();
+    if (mode == 1) {
+        s_pomo_total_sec = 5 * 60;
+        s_pomo_sec = 5 * 60;
+        s_pomo_running = true;
+        bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock",
+                         TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
+        if (s_cur_view == VIEW_CLOCK) refresh_pomo_widgets();
+        show_toast_internal(TR("已加时 5 分钟", "+5 min started"));
+    } else {
+        /* Snooze daily alarm by 5 minutes from now */
+        time_t now_t = time(NULL) + 5 * 60;
+        struct tm tm_snz;
+        localtime_r(&now_t, &tm_snz);
+        if (tm_snz.tm_year > (2020 - 1900)) {
+            s_alarm_hour = (uint8_t)tm_snz.tm_hour;
+            s_alarm_min = (uint8_t)tm_snz.tm_min;
+        } else {
+            int total_m = ((int)s_alarm_hour * 60 + (int)s_alarm_min + 5) % (24 * 60);
+            s_alarm_hour = (uint8_t)(total_m / 60);
+            s_alarm_min = (uint8_t)(total_m % 60);
+        }
+        s_alarm_enabled = true;
+        s_alarm_last_fired_key = -1;
+        save_clock_prefs();
+        if (s_cur_view == VIEW_CLOCK) refresh_pomo_widgets();
+        char msg[40];
+        snprintf(msg, sizeof(msg), TR("贪睡至 %02u:%02u", "Snoozed to %02u:%02u"),
+                 (unsigned)s_alarm_hour, (unsigned)s_alarm_min);
+        show_toast_internal(msg);
+    }
+}
+
+static void alarm_bell_pulse_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
+static void trigger_alarm_ring(uint8_t mode)
+{
+    s_alarm_ring_mode = mode;
+    bsp_audio_alarm_start(45000);
+
+    if (s_alarm_overlay) {
+        lv_obj_del(s_alarm_overlay);
+        s_alarm_overlay = NULL;
+    }
+
+    const os_theme_t *th = T();
+    s_alarm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_alarm_overlay, SWIFT_SCREEN_W, SWIFT_SCREEN_H);
+    lv_obj_set_pos(s_alarm_overlay, 0, 0);
+    lv_obj_set_style_bg_color(s_alarm_overlay, lv_color_hex(0x000000U), 0);
+    lv_obj_set_style_bg_opa(s_alarm_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_alarm_overlay, 0, 0);
+    lv_obj_set_style_radius(s_alarm_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_alarm_overlay, 0, 0);
+    lv_obj_clear_flag(s_alarm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(s_alarm_overlay);
+    lv_obj_set_size(card, 276, 170);
+    lv_obj_center(card);
+    style_bento_card(card, 16, true);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xEF4444U), 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *badge = lv_obj_create(card);
+    lv_obj_set_size(badge, 44, 44);
+    lv_obj_align(badge, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, lv_color_hex(0xEF4444U), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *bsym = lv_label_create(badge);
+    lv_label_set_text(bsym, LV_SYMBOL_BELL);
+    lv_obj_set_style_text_color(bsym, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(bsym, &lv_font_montserrat_20, 0);
+    lv_obj_center(bsym);
+
+    lv_anim_t pa;
+    lv_anim_init(&pa);
+    lv_anim_set_var(&pa, badge);
+    lv_anim_set_exec_cb(&pa, alarm_bell_pulse_cb);
+    lv_anim_set_values(&pa, LV_OPA_COVER, LV_OPA_40);
+    lv_anim_set_time(&pa, 450);
+    lv_anim_set_playback_time(&pa, 450);
+    lv_anim_set_repeat_count(&pa, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&pa);
+
+    lv_obj_t *ttl = lv_label_create(card);
+    lv_label_set_text(ttl, (mode == 1) ? TR("番茄钟时间到!", "Pomodoro Time's Up!")
+                                       : TR("闹钟时间到!", "Alarm Ringing!"));
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(ttl, &ui_font_cjk_14, 0);
+
+    lv_obj_t *sub = lv_label_create(card);
+    char sbuf[48];
+    if (mode == 1) {
+        char dur[24];
+        format_pomo_total_str(dur, sizeof(dur));
+        snprintf(sbuf, sizeof(sbuf), TR("专注已完成 (%s)", "Focus done (%s)"), dur);
+    } else {
+        snprintf(sbuf, sizeof(sbuf), TR("定时闹钟 %02u:%02u", "Daily Alarm %02u:%02u"),
+                 (unsigned)s_alarm_hour, (unsigned)s_alarm_min);
+    }
+    lv_label_set_text(sub, sbuf);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 74);
+    lv_obj_set_style_text_color(sub, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(sub, &ui_font_cjk_14, 0);
+
+    lv_obj_t *b_snz = lv_btn_create(card);
+    lv_obj_set_size(b_snz, 114, 38);
+    lv_obj_align(b_snz, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    style_tactile_btn(b_snz, th->recess_bg, th->lip_shadow, 10);
+    lv_obj_add_event_cb(b_snz, on_alarm_snooze_click, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ls = lv_label_create(b_snz);
+    lv_label_set_text(ls, (mode == 1) ? TR("再来5分钟", "+5 Min") : TR("贪睡5分", "Snooze 5m"));
+    lv_obj_set_style_text_color(ls, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(ls, &ui_font_cjk_14, 0);
+    lv_obj_center(ls);
+
+    lv_obj_t *b_stp = lv_btn_create(card);
+    lv_obj_set_size(b_stp, 128, 38);
+    lv_obj_align(b_stp, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    style_tactile_btn(b_stp, 0xEF4444U, 0xB91C1CU, 10);
+    lv_obj_add_event_cb(b_stp, on_alarm_stop_click, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lt = lv_label_create(b_stp);
+    lv_label_set_text(lt, TR("停止响铃", "Stop Alarm"));
+    lv_obj_set_style_text_color(lt, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(lt, &ui_font_cjk_14, 0);
+    lv_obj_center(lt);
+
+    if (s_cur_view == VIEW_CLOCK) {
+        refresh_pomo_widgets();
+    }
+}
+
+static lv_obj_t *make_modal_step_btn(lv_obj_t *parent, int x, int y, int w, int h,
+                                     const char *txt, lv_event_cb_t cb, void *ud)
+{
+    const os_theme_t *th = T();
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_set_pos(b, x, y);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_style_bg_color(b, lv_color_hex(th->recess_bg), 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(th->accent_tint), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(th->recess_border), 0);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_SHORT_CLICKED, ud);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_LONG_PRESSED, ud);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_LONG_PRESSED_REPEAT, ud);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_center(l);
+    return b;
+}
+
+static void on_clock_modal_cancel(lv_event_t *e)
+{
+    (void)e;
+    close_clock_modal();
+}
+
+/* --- Modal A: Custom Pomodoro Duration Setter --- */
+
+static void refresh_ed_pomo_labels(void)
+{
+    if (s_ed_pomo_min == 0 && s_ed_pomo_sec < 10) s_ed_pomo_sec = 10;
+    if (s_ed_lbl_pmin) {
+        char b[8];
+        snprintf(b, sizeof(b), "%02d", s_ed_pomo_min);
+        lv_label_set_text(s_ed_lbl_pmin, b);
+    }
+    if (s_ed_lbl_psec) {
+        char b[8];
+        snprintf(b, sizeof(b), "%02d", s_ed_pomo_sec);
+        lv_label_set_text(s_ed_lbl_psec, b);
+    }
+}
+
+static void on_ed_pomo_preset(lv_event_t *e)
+{
+    int secs = (int)(intptr_t)lv_event_get_user_data(e);
+    s_ed_pomo_min = secs / 60;
+    s_ed_pomo_sec = secs % 60;
+    refresh_ed_pomo_labels();
+}
+
+static void on_ed_pomo_step(lv_event_t *e)
+{
+    int cmd = (int)(intptr_t)lv_event_get_user_data(e);
+    if (cmd == 1) { s_ed_pomo_min = (s_ed_pomo_min > 0) ? (s_ed_pomo_min - 1) : 120; }
+    else if (cmd == 2) { s_ed_pomo_min = (s_ed_pomo_min < 120) ? (s_ed_pomo_min + 1) : 0; }
+    else if (cmd == 3) { s_ed_pomo_sec = (s_ed_pomo_sec >= 5) ? (s_ed_pomo_sec - 5) : 55; }
+    else if (cmd == 4) { s_ed_pomo_sec = (s_ed_pomo_sec <= 50) ? (s_ed_pomo_sec + 5) : 0; }
+    refresh_ed_pomo_labels();
+}
+
+static void on_ed_pomo_save(lv_event_t *e)
+{
+    (void)e;
+    int total = s_ed_pomo_min * 60 + s_ed_pomo_sec;
+    if (total < 10) total = 10;
+    if (total > 7200) total = 7200;
+    s_pomo_running = false;
+    s_pomo_total_sec = total;
+    s_pomo_sec = total;
+    save_clock_prefs();
+    close_clock_modal();
+    refresh_pomo_widgets();
+    char msg[40], dur[24];
+    format_pomo_total_str(dur, sizeof(dur));
+    snprintf(msg, sizeof(msg), TR("番茄钟已设为 %s", "Timer set: %s"), dur);
+    show_toast_internal(msg);
+}
+
+static void open_pomo_set_modal(void)
+{
+    close_clock_modal();
+    const os_theme_t *th = T();
+    s_ed_pomo_min = s_pomo_total_sec / 60;
+    s_ed_pomo_sec = (s_pomo_total_sec % 60 / 5) * 5;
+    if (s_ed_pomo_min == 0 && s_ed_pomo_sec < 10) s_ed_pomo_sec = 10;
+
+    s_clock_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_clock_modal, SWIFT_SCREEN_W, SWIFT_SCREEN_H);
+    lv_obj_set_pos(s_clock_modal, 0, 0);
+    lv_obj_set_style_bg_color(s_clock_modal, lv_color_hex(0x000000U), 0);
+    lv_obj_set_style_bg_opa(s_clock_modal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_clock_modal, 0, 0);
+    lv_obj_set_style_radius(s_clock_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_clock_modal, 0, 0);
+    lv_obj_clear_flag(s_clock_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(s_clock_modal);
+    lv_obj_set_size(card, 294, 198);
+    lv_obj_center(card);
+    style_bento_card(card, 14, true);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(card);
+    lv_label_set_text(ttl, TR("设置番茄钟时长", "Set Timer Duration"));
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(ttl, &ui_font_cjk_14, 0);
+
+    /* Quick preset pills: 10s, 1m, 5m, 15m, 25m, 45m */
+    static const struct { const char *lbl; int sec; } k_presets[6] = {
+        { "10s", 10 }, { "1m", 60 }, { "5m", 300 },
+        { "15m", 900 }, { "25m", 1500 }, { "45m", 2700 }
+    };
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *pb = lv_btn_create(card);
+        lv_obj_set_pos(pb, i * 46, 26);
+        lv_obj_set_size(pb, 42, 26);
+        lv_obj_set_style_bg_color(pb, lv_color_hex(th->accent_tint), 0);
+        lv_obj_set_style_border_width(pb, 1, 0);
+        lv_obj_set_style_border_color(pb, lv_color_hex(th->accent_border), 0);
+        lv_obj_set_style_radius(pb, 7, 0);
+        lv_obj_set_style_shadow_width(pb, 0, 0);
+        lv_obj_set_style_pad_all(pb, 0, 0);
+        lv_obj_add_event_cb(pb, on_ed_pomo_preset, LV_EVENT_CLICKED, (void *)(intptr_t)k_presets[i].sec);
+        lv_obj_t *pl = lv_label_create(pb);
+        lv_label_set_text(pl, k_presets[i].lbl);
+        lv_obj_set_style_text_color(pl, lv_color_hex(th->accent), 0);
+        lv_obj_set_style_text_font(pl, &lv_font_montserrat_12, 0);
+        lv_obj_center(pl);
+    }
+
+    /* Custom Minutes & Seconds Steppers */
+    lv_obj_t *lm_hdr = lv_label_create(card);
+    lv_label_set_text(lm_hdr, TR("分钟", "Min"));
+    lv_obj_set_pos(lm_hdr, 46, 62);
+    lv_obj_set_style_text_color(lm_hdr, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(lm_hdr, &ui_font_cjk_14, 0);
+
+    lv_obj_t *ls_hdr = lv_label_create(card);
+    lv_label_set_text(ls_hdr, TR("秒钟", "Sec"));
+    lv_obj_set_pos(ls_hdr, 192, 62);
+    lv_obj_set_style_text_color(ls_hdr, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(ls_hdr, &ui_font_cjk_14, 0);
+
+    make_modal_step_btn(card, 0, 84, 34, 38, "-", on_ed_pomo_step, (void *)1);
+    lv_obj_t *mb = lv_obj_create(card);
+    lv_obj_set_pos(mb, 38, 84);
+    lv_obj_set_size(mb, 52, 38);
+    style_recess_box(mb, 8);
+    lv_obj_set_style_pad_all(mb, 0, 0);
+    lv_obj_clear_flag(mb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_pmin = lv_label_create(mb);
+    lv_obj_set_style_text_color(s_ed_lbl_pmin, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_pmin, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_pmin);
+    make_modal_step_btn(card, 94, 84, 34, 38, "+", on_ed_pomo_step, (void *)2);
+
+    lv_obj_t *col = lv_label_create(card);
+    lv_label_set_text(col, ":");
+    lv_obj_set_pos(col, 134, 88);
+    lv_obj_set_style_text_color(col, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(col, &lv_font_montserrat_24, 0);
+
+    make_modal_step_btn(card, 146, 84, 34, 38, "-", on_ed_pomo_step, (void *)3);
+    lv_obj_t *sb = lv_obj_create(card);
+    lv_obj_set_pos(sb, 184, 84);
+    lv_obj_set_size(sb, 52, 38);
+    style_recess_box(sb, 8);
+    lv_obj_set_style_pad_all(sb, 0, 0);
+    lv_obj_clear_flag(sb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_psec = lv_label_create(sb);
+    lv_obj_set_style_text_color(s_ed_lbl_psec, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_psec, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_psec);
+    make_modal_step_btn(card, 240, 84, 34, 38, "+", on_ed_pomo_step, (void *)4);
+
+    refresh_ed_pomo_labels();
+
+    lv_obj_t *bc = lv_btn_create(card);
+    lv_obj_set_size(bc, 126, 36);
+    lv_obj_align(bc, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    style_tactile_btn(bc, th->recess_bg, th->lip_shadow, 9);
+    lv_obj_add_event_cb(bc, on_clock_modal_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lc = lv_label_create(bc);
+    lv_label_set_text(lc, TR("取消", "Cancel"));
+    lv_obj_set_style_text_color(lc, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(lc, &ui_font_cjk_14, 0);
+    lv_obj_center(lc);
+
+    lv_obj_t *bs = lv_btn_create(card);
+    lv_obj_set_size(bs, 136, 36);
+    lv_obj_align(bs, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    style_tactile_btn(bs, th->accent, shift_rgb(th->accent, -45), 9);
+    lv_obj_add_event_cb(bs, on_ed_pomo_save, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ls = lv_label_create(bs);
+    lv_label_set_text(ls, TR("确认时长", "Save"));
+    lv_obj_set_style_text_color(ls, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(ls, &ui_font_cjk_14, 0);
+    lv_obj_center(ls);
+}
+
+/* --- Modal B: Manual System Time & Date Setter --- */
+
+static void refresh_ed_sys_time_labels(void)
+{
+    int maxd = days_in_month(s_ed_clk_yr, s_ed_clk_mo);
+    if (s_ed_clk_dy > maxd) s_ed_clk_dy = maxd;
+    char b[12];
+    if (s_ed_lbl_hh) { snprintf(b, sizeof(b), "%02d", s_ed_clk_hh); lv_label_set_text(s_ed_lbl_hh, b); }
+    if (s_ed_lbl_mm) { snprintf(b, sizeof(b), "%02d", s_ed_clk_mm); lv_label_set_text(s_ed_lbl_mm, b); }
+    if (s_ed_lbl_yr) { snprintf(b, sizeof(b), "%04d", s_ed_clk_yr); lv_label_set_text(s_ed_lbl_yr, b); }
+    if (s_ed_lbl_mo) { snprintf(b, sizeof(b), "%02d", s_ed_clk_mo); lv_label_set_text(s_ed_lbl_mo, b); }
+    if (s_ed_lbl_dy) { snprintf(b, sizeof(b), "%02d", s_ed_clk_dy); lv_label_set_text(s_ed_lbl_dy, b); }
+}
+
+static void on_ed_sys_time_step(lv_event_t *e)
+{
+    int cmd = (int)(intptr_t)lv_event_get_user_data(e);
+    switch (cmd) {
+    case 1: s_ed_clk_hh = (s_ed_clk_hh + 23) % 24; break;
+    case 2: s_ed_clk_hh = (s_ed_clk_hh + 1) % 24; break;
+    case 3: s_ed_clk_mm = (s_ed_clk_mm + 59) % 60; break;
+    case 4: s_ed_clk_mm = (s_ed_clk_mm + 1) % 60; break;
+    case 5: s_ed_clk_yr = (s_ed_clk_yr > 2024) ? (s_ed_clk_yr - 1) : 2035; break;
+    case 6: s_ed_clk_yr = (s_ed_clk_yr < 2035) ? (s_ed_clk_yr + 1) : 2024; break;
+    case 7: s_ed_clk_mo = (s_ed_clk_mo > 1) ? (s_ed_clk_mo - 1) : 12; break;
+    case 8: s_ed_clk_mo = (s_ed_clk_mo < 12) ? (s_ed_clk_mo + 1) : 1; break;
+    case 9: {
+        int md = days_in_month(s_ed_clk_yr, s_ed_clk_mo);
+        s_ed_clk_dy = (s_ed_clk_dy > 1) ? (s_ed_clk_dy - 1) : md;
+        break;
+    }
+    case 10: {
+        int md = days_in_month(s_ed_clk_yr, s_ed_clk_mo);
+        s_ed_clk_dy = (s_ed_clk_dy < md) ? (s_ed_clk_dy + 1) : 1;
+        break;
+    }
+    default: break;
+    }
+    refresh_ed_sys_time_labels();
+}
+
+static void on_ed_sys_time_save(lv_event_t *e)
+{
+    (void)e;
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    struct tm t = {0};
+    t.tm_year = s_ed_clk_yr - 1900;
+    t.tm_mon  = s_ed_clk_mo - 1;
+    t.tm_mday = s_ed_clk_dy;
+    t.tm_hour = s_ed_clk_hh;
+    t.tm_min  = s_ed_clk_mm;
+    t.tm_sec  = 0;
+    time_t epoch = mktime(&t);
+    if (epoch > 0) {
+        struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        s_alarm_last_fired_key = -1;
+        char clk[16], hh[4], mm[4];
+        snprintf(clk, sizeof(clk), "%02d:%02d", s_ed_clk_hh, s_ed_clk_mm);
+        snprintf(hh, sizeof(hh), "%02d", s_ed_clk_hh);
+        snprintf(mm, sizeof(mm), "%02d", s_ed_clk_mm);
+        if (s_lbl_clock) lv_label_set_text(s_lbl_clock, clk);
+        if (s_home_clock_lbl) lv_label_set_text(s_home_clock_lbl, clk);
+        if (s_lbl_clk_hh) lv_label_set_text(s_lbl_clk_hh, hh);
+        if (s_lbl_clk_mm) lv_label_set_text(s_lbl_clk_mm, mm);
+        s_cache_hm_date[0] = '\0';
+    }
+    close_clock_modal();
+    show_toast_internal(TR("系统时间已校准", "System time updated"));
+}
+
+static void open_sys_time_modal(void)
+{
+    close_clock_modal();
+    const os_theme_t *th = T();
+
+    time_t now_t = time(NULL);
+    struct tm tm_info;
+    localtime_r(&now_t, &tm_info);
+    if (tm_info.tm_year > (2020 - 1900)) {
+        s_ed_clk_yr = tm_info.tm_year + 1900;
+        s_ed_clk_mo = tm_info.tm_mon + 1;
+        s_ed_clk_dy = tm_info.tm_mday;
+        s_ed_clk_hh = tm_info.tm_hour;
+        s_ed_clk_mm = tm_info.tm_min;
+    } else {
+        s_ed_clk_yr = 2026;
+        s_ed_clk_mo = 11;
+        s_ed_clk_dy = 23;
+        s_ed_clk_hh = 12;
+        s_ed_clk_mm = 0;
+    }
+
+    s_clock_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_clock_modal, SWIFT_SCREEN_W, SWIFT_SCREEN_H);
+    lv_obj_set_pos(s_clock_modal, 0, 0);
+    lv_obj_set_style_bg_color(s_clock_modal, lv_color_hex(0x000000U), 0);
+    lv_obj_set_style_bg_opa(s_clock_modal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_clock_modal, 0, 0);
+    lv_obj_set_style_radius(s_clock_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_clock_modal, 0, 0);
+    lv_obj_clear_flag(s_clock_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(s_clock_modal);
+    lv_obj_set_size(card, 300, 210);
+    lv_obj_center(card);
+    style_bento_card(card, 14, true);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(card);
+    lv_label_set_text(ttl, TR("手动校准时间", "Set System Time"));
+    lv_obj_align(ttl, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(ttl, &ui_font_cjk_14, 0);
+
+    /* Row 1: Hour : Minute */
+    make_modal_step_btn(card, 4, 28, 34, 42, "-", on_ed_sys_time_step, (void *)1);
+    lv_obj_t *hb = lv_obj_create(card);
+    lv_obj_set_pos(hb, 42, 28);
+    lv_obj_set_size(hb, 52, 42);
+    style_recess_box(hb, 8);
+    lv_obj_set_style_pad_all(hb, 0, 0);
+    lv_obj_clear_flag(hb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_hh = lv_label_create(hb);
+    lv_obj_set_style_text_color(s_ed_lbl_hh, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_hh, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_hh);
+    make_modal_step_btn(card, 98, 28, 34, 42, "+", on_ed_sys_time_step, (void *)2);
+
+    lv_obj_t *col = lv_label_create(card);
+    lv_label_set_text(col, ":");
+    lv_obj_set_pos(col, 137, 34);
+    lv_obj_set_style_text_color(col, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(col, &lv_font_montserrat_24, 0);
+
+    make_modal_step_btn(card, 148, 28, 34, 42, "-", on_ed_sys_time_step, (void *)3);
+    lv_obj_t *mb = lv_obj_create(card);
+    lv_obj_set_pos(mb, 186, 28);
+    lv_obj_set_size(mb, 52, 42);
+    style_recess_box(mb, 8);
+    lv_obj_set_style_pad_all(mb, 0, 0);
+    lv_obj_clear_flag(mb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_mm = lv_label_create(mb);
+    lv_obj_set_style_text_color(s_ed_lbl_mm, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_mm, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_mm);
+    make_modal_step_btn(card, 242, 28, 34, 42, "+", on_ed_sys_time_step, (void *)4);
+
+    /* Row 2: Year / Month / Day */
+    lv_obj_t *dl = lv_label_create(card);
+    lv_label_set_text(dl, TR("日期 (年 / 月 / 日)", "Date (Y / M / D)"));
+    lv_obj_set_pos(dl, 4, 80);
+    lv_obj_set_style_text_color(dl, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(dl, &ui_font_cjk_14, 0);
+
+    /* Year */
+    make_modal_step_btn(card, 2, 102, 26, 32, "-", on_ed_sys_time_step, (void *)5);
+    lv_obj_t *yb = lv_obj_create(card);
+    lv_obj_set_pos(yb, 30, 102);
+    lv_obj_set_size(yb, 48, 32);
+    style_recess_box(yb, 6);
+    lv_obj_set_style_pad_all(yb, 0, 0);
+    lv_obj_clear_flag(yb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_yr = lv_label_create(yb);
+    lv_obj_set_style_text_color(s_ed_lbl_yr, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_yr, &lv_font_montserrat_14, 0);
+    lv_obj_center(s_ed_lbl_yr);
+    make_modal_step_btn(card, 80, 102, 26, 32, "+", on_ed_sys_time_step, (void *)6);
+
+    /* Month */
+    make_modal_step_btn(card, 112, 102, 24, 32, "-", on_ed_sys_time_step, (void *)7);
+    lv_obj_t *mob = lv_obj_create(card);
+    lv_obj_set_pos(mob, 138, 102);
+    lv_obj_set_size(mob, 28, 32);
+    style_recess_box(mob, 6);
+    lv_obj_set_style_pad_all(mob, 0, 0);
+    lv_obj_clear_flag(mob, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_mo = lv_label_create(mob);
+    lv_obj_set_style_text_color(s_ed_lbl_mo, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_mo, &lv_font_montserrat_14, 0);
+    lv_obj_center(s_ed_lbl_mo);
+    make_modal_step_btn(card, 168, 102, 24, 32, "+", on_ed_sys_time_step, (void *)8);
+
+    /* Day */
+    make_modal_step_btn(card, 198, 102, 24, 32, "-", on_ed_sys_time_step, (void *)9);
+    lv_obj_t *dyb = lv_obj_create(card);
+    lv_obj_set_pos(dyb, 224, 102);
+    lv_obj_set_size(dyb, 28, 32);
+    style_recess_box(dyb, 6);
+    lv_obj_set_style_pad_all(dyb, 0, 0);
+    lv_obj_clear_flag(dyb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_dy = lv_label_create(dyb);
+    lv_obj_set_style_text_color(s_ed_lbl_dy, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_dy, &lv_font_montserrat_14, 0);
+    lv_obj_center(s_ed_lbl_dy);
+    make_modal_step_btn(card, 254, 102, 24, 32, "+", on_ed_sys_time_step, (void *)10);
+
+    refresh_ed_sys_time_labels();
+
+    lv_obj_t *bc = lv_btn_create(card);
+    lv_obj_set_size(bc, 128, 36);
+    lv_obj_align(bc, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    style_tactile_btn(bc, th->recess_bg, th->lip_shadow, 9);
+    lv_obj_add_event_cb(bc, on_clock_modal_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lc = lv_label_create(bc);
+    lv_label_set_text(lc, TR("取消", "Cancel"));
+    lv_obj_set_style_text_color(lc, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(lc, &ui_font_cjk_14, 0);
+    lv_obj_center(lc);
+
+    lv_obj_t *bs = lv_btn_create(card);
+    lv_obj_set_size(bs, 140, 36);
+    lv_obj_align(bs, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    style_tactile_btn(bs, th->accent, shift_rgb(th->accent, -45), 9);
+    lv_obj_add_event_cb(bs, on_ed_sys_time_save, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ls = lv_label_create(bs);
+    lv_label_set_text(ls, TR("保存时间", "Apply"));
+    lv_obj_set_style_text_color(ls, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(ls, &ui_font_cjk_14, 0);
+    lv_obj_center(ls);
+}
+
+/* --- Modal C: Daily Alarm Clock Setter --- */
+
+static void refresh_ed_alarm_labels(void)
+{
+    char b[8];
+    if (s_ed_lbl_al_hh) { snprintf(b, sizeof(b), "%02d", s_ed_al_hh); lv_label_set_text(s_ed_lbl_al_hh, b); }
+    if (s_ed_lbl_al_mm) { snprintf(b, sizeof(b), "%02d", s_ed_al_mm); lv_label_set_text(s_ed_lbl_al_mm, b); }
+    if (s_ed_lbl_al_st) {
+        const os_theme_t *th = T();
+        lv_label_set_text(s_ed_lbl_al_st, s_ed_al_en ? TR("已开启", "ON") : TR("已关闭", "OFF"));
+        lv_obj_set_style_text_color(s_ed_lbl_al_st,
+                                    lv_color_hex(s_ed_al_en ? th->muted_ok : th->text_mut), 0);
+    }
+}
+
+static void on_ed_alarm_sw(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    s_ed_al_en = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    refresh_ed_alarm_labels();
+}
+
+static void on_ed_alarm_step(lv_event_t *e)
+{
+    int cmd = (int)(intptr_t)lv_event_get_user_data(e);
+    if (cmd == 1) s_ed_al_hh = (s_ed_al_hh + 23) % 24;
+    else if (cmd == 2) s_ed_al_hh = (s_ed_al_hh + 1) % 24;
+    else if (cmd == 3) s_ed_al_mm = (s_ed_al_mm + 59) % 60;
+    else if (cmd == 4) s_ed_al_mm = (s_ed_al_mm + 1) % 60;
+    refresh_ed_alarm_labels();
+}
+
+static void on_ed_alarm_test(lv_event_t *e)
+{
+    (void)e;
+    if (bsp_audio_is_alarm_ringing()) {
+        bsp_audio_alarm_stop();
+    } else {
+        bsp_audio_alarm_start(2200);
+        show_toast_internal(TR("试听闹铃...", "Testing chime..."));
+    }
+}
+
+static void on_ed_alarm_save(lv_event_t *e)
+{
+    (void)e;
+    bsp_audio_alarm_stop();
+    s_alarm_enabled = s_ed_al_en;
+    s_alarm_hour = (uint8_t)s_ed_al_hh;
+    s_alarm_min = (uint8_t)s_ed_al_mm;
+    s_alarm_last_fired_key = -1;
+    save_clock_prefs();
+    close_clock_modal();
+    refresh_pomo_widgets();
+    if (s_alarm_enabled) {
+        char msg[40];
+        snprintf(msg, sizeof(msg), TR("闹钟已设 %02u:%02u", "Alarm set %02u:%02u"),
+                 (unsigned)s_alarm_hour, (unsigned)s_alarm_min);
+        show_toast_internal(msg);
+    } else {
+        show_toast_internal(TR("定时闹钟已关闭", "Alarm disabled"));
+    }
+}
+
+static void open_alarm_set_modal(void)
+{
+    close_clock_modal();
+    const os_theme_t *th = T();
+    s_ed_al_hh = s_alarm_hour;
+    s_ed_al_mm = s_alarm_min;
+    s_ed_al_en = s_alarm_enabled;
+
+    s_clock_modal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_clock_modal, SWIFT_SCREEN_W, SWIFT_SCREEN_H);
+    lv_obj_set_pos(s_clock_modal, 0, 0);
+    lv_obj_set_style_bg_color(s_clock_modal, lv_color_hex(0x000000U), 0);
+    lv_obj_set_style_bg_opa(s_clock_modal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(s_clock_modal, 0, 0);
+    lv_obj_set_style_radius(s_clock_modal, 0, 0);
+    lv_obj_set_style_pad_all(s_clock_modal, 0, 0);
+    lv_obj_clear_flag(s_clock_modal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(s_clock_modal);
+    lv_obj_set_size(card, 294, 186);
+    lv_obj_center(card);
+    style_bento_card(card, 14, true);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(card);
+    lv_label_set_text(ttl, TR("定时闹钟", "Alarm Clock"));
+    lv_obj_align(ttl, LV_ALIGN_TOP_LEFT, 2, 4);
+    lv_obj_set_style_text_color(ttl, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(ttl, &ui_font_cjk_14, 0);
+
+    s_ed_lbl_al_st = lv_label_create(card);
+    lv_obj_align(s_ed_lbl_al_st, LV_ALIGN_TOP_RIGHT, -54, 4);
+    lv_obj_set_style_text_font(s_ed_lbl_al_st, &ui_font_cjk_14, 0);
+
+    lv_obj_t *sw = lv_switch_create(card);
+    lv_obj_set_size(sw, 44, 24);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(th->recess_border), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(th->accent), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (s_ed_al_en) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, on_ed_alarm_sw, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* Hour : Minute Steppers */
+    make_modal_step_btn(card, 0, 50, 34, 44, "-", on_ed_alarm_step, (void *)1);
+    lv_obj_t *hb = lv_obj_create(card);
+    lv_obj_set_pos(hb, 38, 50);
+    lv_obj_set_size(hb, 52, 44);
+    style_recess_box(hb, 8);
+    lv_obj_set_style_pad_all(hb, 0, 0);
+    lv_obj_clear_flag(hb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_al_hh = lv_label_create(hb);
+    lv_obj_set_style_text_color(s_ed_lbl_al_hh, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_al_hh, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_al_hh);
+    make_modal_step_btn(card, 94, 50, 34, 44, "+", on_ed_alarm_step, (void *)2);
+
+    lv_obj_t *col = lv_label_create(card);
+    lv_label_set_text(col, ":");
+    lv_obj_set_pos(col, 134, 58);
+    lv_obj_set_style_text_color(col, lv_color_hex(th->text_sec), 0);
+    lv_obj_set_style_text_font(col, &lv_font_montserrat_24, 0);
+
+    make_modal_step_btn(card, 146, 50, 34, 44, "-", on_ed_alarm_step, (void *)3);
+    lv_obj_t *mb = lv_obj_create(card);
+    lv_obj_set_pos(mb, 184, 50);
+    lv_obj_set_size(mb, 52, 44);
+    style_recess_box(mb, 8);
+    lv_obj_set_style_pad_all(mb, 0, 0);
+    lv_obj_clear_flag(mb, LV_OBJ_FLAG_SCROLLABLE);
+    s_ed_lbl_al_mm = lv_label_create(mb);
+    lv_obj_set_style_text_color(s_ed_lbl_al_mm, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_ed_lbl_al_mm, &lv_font_montserrat_24, 0);
+    lv_obj_center(s_ed_lbl_al_mm);
+    make_modal_step_btn(card, 240, 50, 34, 44, "+", on_ed_alarm_step, (void *)4);
+
+    refresh_ed_alarm_labels();
+
+    /* Bottom Row: Cancel | Test Chime | Save */
+    lv_obj_t *bc = lv_btn_create(card);
+    lv_obj_set_size(bc, 78, 36);
+    lv_obj_align(bc, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    style_tactile_btn(bc, th->recess_bg, th->lip_shadow, 9);
+    lv_obj_add_event_cb(bc, on_clock_modal_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lc = lv_label_create(bc);
+    lv_label_set_text(lc, TR("取消", "Cancel"));
+    lv_obj_set_style_text_color(lc, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(lc, &ui_font_cjk_14, 0);
+    lv_obj_center(lc);
+
+    lv_obj_t *bt = lv_btn_create(card);
+    lv_obj_set_size(bt, 84, 36);
+    lv_obj_align(bt, LV_ALIGN_BOTTOM_MID, -6, 0);
+    style_tactile_btn(bt, th->accent_tint, th->lip_shadow, 9);
+    lv_obj_set_style_border_width(bt, 1, 0);
+    lv_obj_set_style_border_color(bt, lv_color_hex(th->accent_border), 0);
+    lv_obj_add_event_cb(bt, on_ed_alarm_test, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lt = lv_label_create(bt);
+    lv_label_set_text(lt, TR("试听铃声", "Test"));
+    lv_obj_set_style_text_color(lt, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_text_font(lt, &ui_font_cjk_14, 0);
+    lv_obj_center(lt);
+
+    lv_obj_t *bs = lv_btn_create(card);
+    lv_obj_set_size(bs, 96, 36);
+    lv_obj_align(bs, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    style_tactile_btn(bs, th->accent, shift_rgb(th->accent, -45), 9);
+    lv_obj_add_event_cb(bs, on_ed_alarm_save, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ls = lv_label_create(bs);
+    lv_label_set_text(ls, TR("保存闹钟", "Save"));
+    lv_obj_set_style_text_color(ls, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(ls, &ui_font_cjk_14, 0);
+    lv_obj_center(ls);
+}
+
+/* --- Main Clock View Callbacks --- */
 
 static void on_pomo_toggle(lv_event_t *e)
 {
     (void)e;
+    if (s_alarm_ring_mode != 0) {
+        stop_alarm_ring();
+        show_toast_internal(TR("已关闭闹铃", "Alarm stopped"));
+        return;
+    }
+    if (!s_pomo_running && s_pomo_sec <= 0) {
+        s_pomo_sec = s_pomo_total_sec;
+    }
     s_pomo_running = !s_pomo_running;
+    if (s_pomo_running) {
+        bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock",
+                         TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
+    }
     refresh_pomo_widgets();
-    show_toast_internal(s_pomo_running ? "番茄钟开始" : "番茄钟暂停");
+    show_toast_internal(s_pomo_running ? TR("番茄钟开始", "Timer started")
+                                       : TR("番茄钟暂停", "Timer paused"));
 }
 
 static void on_pomo_reset(lv_event_t *e)
 {
     (void)e;
+    if (s_alarm_ring_mode != 0) {
+        stop_alarm_ring();
+    }
     s_pomo_running = false;
-    s_pomo_sec = 25 * 60;
+    s_pomo_sec = s_pomo_total_sec;
     refresh_pomo_widgets();
+    show_toast_internal(TR("已重置倒计时", "Timer reset"));
+}
+
+static void on_pomo_quick_adj(lv_event_t *e)
+{
+    int dir = (int)(intptr_t)lv_event_get_user_data(e);
+    if (s_pomo_running) {
+        s_pomo_running = false;
+    }
+    int cur_m = (s_pomo_total_sec + 59) / 60;
+    if (dir < 0) {
+        if (cur_m > 5) cur_m = ((cur_m - 1) / 5) * 5;
+        else if (cur_m > 1) cur_m--;
+        else cur_m = 1;
+    } else {
+        if (cur_m < 5) cur_m++;
+        else cur_m = ((cur_m / 5) + 1) * 5;
+        if (cur_m > 120) cur_m = 120;
+    }
+    s_pomo_total_sec = cur_m * 60;
+    s_pomo_sec = s_pomo_total_sec;
+    save_clock_prefs();
+    refresh_pomo_widgets();
+}
+
+static void on_open_pomo_set_click(lv_event_t *e)
+{
+    (void)e;
+    open_pomo_set_modal();
+}
+
+static void on_open_sys_time_click(lv_event_t *e)
+{
+    (void)e;
+    open_sys_time_modal();
+}
+
+static void on_open_alarm_set_click(lv_event_t *e)
+{
+    (void)e;
+    open_alarm_set_modal();
 }
 
 static void show_clock_view(void)
 {
     clear_body_view(VIEW_CLOCK);
-    bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", "番茄时钟", VIEW_CLOCK);
+    bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock",
+                     TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
     const os_theme_t *th = T();
 
     lv_obj_t *bg = lv_obj_create(s_body);
@@ -4243,7 +5407,7 @@ static void show_clock_view(void)
     lv_obj_set_style_pad_all(bg, 0, 0);
     lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Left Card: 270-deg Pomodoro Arc Gauge (x=6, y=4, w=154, h=208) */
+    /* Left Card: Pomodoro Arc Gauge + Custom Duration Bar (x=6, y=4, w=154, h=208) */
     lv_obj_t *lcard = lv_obj_create(bg);
     lv_obj_set_pos(lcard, 6, 4);
     lv_obj_set_size(lcard, 154, 208);
@@ -4252,11 +5416,11 @@ static void show_clock_view(void)
     lv_obj_clear_flag(lcard, LV_OBJ_FLAG_SCROLLABLE);
 
     s_arc_pomo = lv_arc_create(lcard);
-    lv_obj_set_pos(s_arc_pomo, 17, 14);
-    lv_obj_set_size(s_arc_pomo, 120, 120);
+    lv_obj_set_pos(s_arc_pomo, 22, 10);
+    lv_obj_set_size(s_arc_pomo, 110, 110);
     lv_arc_set_rotation(s_arc_pomo, 135);
     lv_arc_set_bg_angles(s_arc_pomo, 0, 270);
-    lv_arc_set_range(s_arc_pomo, 0, 25 * 60);
+    lv_arc_set_range(s_arc_pomo, 0, s_pomo_total_sec > 0 ? s_pomo_total_sec : 60);
     lv_arc_set_value(s_arc_pomo, s_pomo_sec);
     lv_obj_clear_flag(s_arc_pomo, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_style_arc_width(s_arc_pomo, 8, LV_PART_MAIN);
@@ -4270,8 +5434,18 @@ static void show_clock_view(void)
     lv_obj_set_style_border_color(s_arc_pomo, lv_color_hex(th->accent), LV_PART_KNOB);
     lv_obj_set_style_pad_all(s_arc_pomo, 1, LV_PART_KNOB);
 
+    /* Transparent hit area over arc/time to open Custom Timer Setter */
+    lv_obj_t *arc_hit = lv_obj_create(lcard);
+    lv_obj_set_pos(arc_hit, 18, 10);
+    lv_obj_set_size(arc_hit, 118, 112);
+    lv_obj_set_style_bg_opa(arc_hit, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(arc_hit, 0, 0);
+    lv_obj_clear_flag(arc_hit, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(arc_hit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(arc_hit, on_open_pomo_set_click, LV_EVENT_CLICKED, NULL);
+
     lv_obj_t *pill = lv_obj_create(lcard);
-    lv_obj_set_pos(pill, 43, 35);
+    lv_obj_set_pos(pill, 43, 27);
     lv_obj_set_size(pill, 68, 18);
     lv_obj_set_style_bg_color(pill, lv_color_hex(th->accent_tint), 0);
     lv_obj_set_style_border_width(pill, 1, 0);
@@ -4280,39 +5454,103 @@ static void show_clock_view(void)
     lv_obj_set_style_pad_all(pill, 0, 0);
     lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *fp = lv_label_create(pill);
-    lv_label_set_text(fp, "专注时段");
+    lv_label_set_text(fp, TR("专注时段", "Focus"));
     lv_obj_set_style_text_color(fp, lv_color_hex(th->accent), 0);
     lv_obj_set_style_text_font(fp, &ui_font_cjk_14, 0);
     lv_obj_center(fp);
 
     s_lbl_pomo = lv_label_create(lcard);
-    lv_obj_align(s_lbl_pomo, LV_ALIGN_TOP_MID, 0, 62);
+    lv_obj_align(s_lbl_pomo, LV_ALIGN_TOP_MID, 0, 50);
     lv_obj_set_style_text_color(s_lbl_pomo, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(s_lbl_pomo, &lv_font_montserrat_24, 0);
 
-    lv_obj_t *sub = lv_label_create(lcard);
-    lv_label_set_text(sub, "共25分钟");
-    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 94);
-    lv_obj_set_style_text_color(sub, lv_color_hex(th->text_mut), 0);
-    lv_obj_set_style_text_font(sub, &ui_font_cjk_14, 0);
+    s_lbl_pomo_sub = lv_label_create(lcard);
+    lv_obj_align(s_lbl_pomo_sub, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_set_style_text_color(s_lbl_pomo_sub, lv_color_hex(th->text_mut), 0);
+    lv_obj_set_style_text_font(s_lbl_pomo_sub, &ui_font_cjk_14, 0);
 
     s_lbl_pomo_state = lv_label_create(lcard);
-    lv_obj_align(s_lbl_pomo_state, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_align(s_lbl_pomo_state, LV_ALIGN_TOP_MID, 0, 130);
     lv_obj_set_style_text_font(s_lbl_pomo_state, &ui_font_cjk_14, 0);
 
-    /* Right Top: Flip Clock Card (x=166, y=4, w=148, h=96) */
+    /* Quick Duration Controls: [-] [设时 / Set] [+] */
+    lv_obj_t *bm = lv_btn_create(lcard);
+    lv_obj_set_pos(bm, 8, 166);
+    lv_obj_set_size(bm, 34, 32);
+    lv_obj_set_style_bg_color(bm, lv_color_hex(th->recess_bg), 0);
+    lv_obj_set_style_border_width(bm, 1, 0);
+    lv_obj_set_style_border_color(bm, lv_color_hex(th->recess_border), 0);
+    lv_obj_set_style_radius(bm, 8, 0);
+    lv_obj_set_style_shadow_width(bm, 0, 0);
+    lv_obj_set_style_pad_all(bm, 0, 0);
+    lv_obj_add_event_cb(bm, on_pomo_quick_adj, LV_EVENT_CLICKED, (void *)-1);
+    lv_obj_t *lm = lv_label_create(bm);
+    lv_label_set_text(lm, "-");
+    lv_obj_set_style_text_color(lm, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(lm, &lv_font_montserrat_16, 0);
+    lv_obj_center(lm);
+
+    lv_obj_t *bset = lv_btn_create(lcard);
+    lv_obj_set_pos(bset, 46, 166);
+    lv_obj_set_size(bset, 62, 32);
+    lv_obj_set_style_bg_color(bset, lv_color_hex(th->accent_tint), 0);
+    lv_obj_set_style_border_width(bset, 1, 0);
+    lv_obj_set_style_border_color(bset, lv_color_hex(th->accent_border), 0);
+    lv_obj_set_style_radius(bset, 8, 0);
+    lv_obj_set_style_shadow_width(bset, 0, 0);
+    lv_obj_set_style_pad_all(bset, 0, 0);
+    lv_obj_add_event_cb(bset, on_open_pomo_set_click, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lset = lv_label_create(bset);
+    lv_label_set_text(lset, TR("设时长", "Set"));
+    lv_obj_set_style_text_color(lset, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_text_font(lset, &ui_font_cjk_14, 0);
+    lv_obj_center(lset);
+
+    lv_obj_t *bp = lv_btn_create(lcard);
+    lv_obj_set_pos(bp, 112, 166);
+    lv_obj_set_size(bp, 34, 32);
+    lv_obj_set_style_bg_color(bp, lv_color_hex(th->recess_bg), 0);
+    lv_obj_set_style_border_width(bp, 1, 0);
+    lv_obj_set_style_border_color(bp, lv_color_hex(th->recess_border), 0);
+    lv_obj_set_style_radius(bp, 8, 0);
+    lv_obj_set_style_shadow_width(bp, 0, 0);
+    lv_obj_set_style_pad_all(bp, 0, 0);
+    lv_obj_add_event_cb(bp, on_pomo_quick_adj, LV_EVENT_CLICKED, (void *)1);
+    lv_obj_t *lp = lv_label_create(bp);
+    lv_label_set_text(lp, "+");
+    lv_obj_set_style_text_color(lp, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(lp, &lv_font_montserrat_16, 0);
+    lv_obj_center(lp);
+
+    /* Right Top: Clickable Flip Clock Card (x=166, y=4, w=148, h=96) -> Opens Manual Time Setter */
     lv_obj_t *rcard = lv_obj_create(bg);
     lv_obj_set_pos(rcard, 166, 4);
     lv_obj_set_size(rcard, 148, 96);
     style_bento_card(rcard, 12, true);
+    lv_obj_set_style_bg_color(rcard, lv_color_hex(shift_rgb(th->card_top, -8)), LV_STATE_PRESSED);
     lv_obj_set_style_pad_all(rcard, 0, 0);
     lv_obj_clear_flag(rcard, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(rcard, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(rcard, on_open_sys_time_click, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *ctitle = lv_label_create(rcard);
-    lv_label_set_text(ctitle, "当前时间");
-    lv_obj_align(ctitle, LV_ALIGN_TOP_MID, 0, 5);
-    lv_obj_set_style_text_color(ctitle, lv_color_hex(th->text_sec), 0);
-    lv_obj_set_style_text_font(ctitle, &ui_font_cjk_14, 0);
+    s_lbl_clk_hdr = lv_label_create(rcard);
+    lv_obj_set_pos(s_lbl_clk_hdr, 10, 5);
+    lv_obj_set_style_text_font(s_lbl_clk_hdr, &ui_font_cjk_14, 0);
+
+    lv_obj_t *edit_chip = lv_obj_create(rcard);
+    lv_obj_set_pos(edit_chip, 100, 4);
+    lv_obj_set_size(edit_chip, 40, 18);
+    lv_obj_set_style_bg_color(edit_chip, lv_color_hex(th->accent_tint), 0);
+    lv_obj_set_style_border_width(edit_chip, 1, 0);
+    lv_obj_set_style_border_color(edit_chip, lv_color_hex(th->accent_border), 0);
+    lv_obj_set_style_radius(edit_chip, 6, 0);
+    lv_obj_set_style_pad_all(edit_chip, 0, 0);
+    lv_obj_clear_flag(edit_chip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *elbl = lv_label_create(edit_chip);
+    lv_label_set_text(elbl, TR("校时", "Set"));
+    lv_obj_set_style_text_color(elbl, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_text_font(elbl, &ui_font_cjk_14, 0);
+    lv_obj_center(elbl);
 
     const char *clk_txt = s_lbl_clock ? lv_label_get_text(s_lbl_clock) : "00:00";
     char hh[4] = "00", mm[4] = "00";
@@ -4322,50 +5560,67 @@ static void show_clock_view(void)
     }
 
     lv_obj_t *fh = lv_obj_create(rcard);
-    lv_obj_set_pos(fh, 12, 26);
+    lv_obj_set_pos(fh, 10, 28);
     lv_obj_set_size(fh, 58, 56);
     style_recess_box(fh, 8);
     lv_obj_set_style_pad_all(fh, 0, 0);
-    lv_obj_clear_flag(fh, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(fh, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     s_lbl_clk_hh = lv_label_create(fh);
     lv_label_set_text(s_lbl_clk_hh, hh);
     lv_obj_set_style_text_color(s_lbl_clk_hh, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(s_lbl_clk_hh, &lv_font_montserrat_32, 0);
     lv_obj_center(s_lbl_clk_hh);
 
+    lv_obj_t *fcol = lv_label_create(rcard);
+    lv_label_set_text(fcol, ":");
+    lv_obj_set_pos(fcol, 70, 38);
+    lv_obj_set_style_text_color(fcol, lv_color_hex(th->text_mut), 0);
+    lv_obj_set_style_text_font(fcol, &lv_font_montserrat_24, 0);
+
     lv_obj_t *fm = lv_obj_create(rcard);
-    lv_obj_set_pos(fm, 78, 26);
+    lv_obj_set_pos(fm, 78, 28);
     lv_obj_set_size(fm, 58, 56);
     style_recess_box(fm, 8);
     lv_obj_set_style_pad_all(fm, 0, 0);
-    lv_obj_clear_flag(fm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(fm, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     s_lbl_clk_mm = lv_label_create(fm);
     lv_label_set_text(s_lbl_clk_mm, mm);
     lv_obj_set_style_text_color(s_lbl_clk_mm, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(s_lbl_clk_mm, &lv_font_montserrat_32, 0);
     lv_obj_center(s_lbl_clk_mm);
 
-    /* Right Bottom: 3D Tactile Controls */
-    lv_obj_t *b1 = lv_btn_create(bg);
-    lv_obj_set_pos(b1, 166, 108);
-    lv_obj_set_size(b1, 148, 48);
-    style_tactile_btn(b1, th->accent, shift_rgb(th->accent, -45), 10);
-    lv_obj_add_event_cb(b1, on_pomo_toggle, LV_EVENT_CLICKED, NULL);
-    s_lbl_pomo_btn = lv_label_create(b1);
+    /* Right Bottom: 3D Tactile Controls (Start/Pause + Reset & Alarm) */
+    s_btn_pomo_toggle = lv_btn_create(bg);
+    lv_obj_set_pos(s_btn_pomo_toggle, 166, 108);
+    lv_obj_set_size(s_btn_pomo_toggle, 148, 46);
+    style_tactile_btn(s_btn_pomo_toggle, th->accent, shift_rgb(th->accent, -45), 10);
+    lv_obj_add_event_cb(s_btn_pomo_toggle, on_pomo_toggle, LV_EVENT_CLICKED, NULL);
+    s_lbl_pomo_btn = lv_label_create(s_btn_pomo_toggle);
     lv_obj_set_style_text_color(s_lbl_pomo_btn, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(s_lbl_pomo_btn, &ui_font_cjk_14, 0);
     lv_obj_center(s_lbl_pomo_btn);
 
     lv_obj_t *b2 = lv_btn_create(bg);
-    lv_obj_set_pos(b2, 166, 164);
-    lv_obj_set_size(b2, 148, 48);
+    lv_obj_set_pos(b2, 166, 162);
+    lv_obj_set_size(b2, 71, 46);
     style_tactile_btn(b2, th->card_top, th->lip_shadow, 10);
     lv_obj_add_event_cb(b2, on_pomo_reset, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l2 = lv_label_create(b2);
-    lv_label_set_text(l2, "重置时间");
+    lv_label_set_text(l2, TR("重置", "Reset"));
     lv_obj_set_style_text_color(l2, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(l2, &ui_font_cjk_14, 0);
     lv_obj_center(l2);
+
+    s_btn_clk_alarm = lv_btn_create(bg);
+    lv_obj_set_pos(s_btn_clk_alarm, 243, 162);
+    lv_obj_set_size(s_btn_clk_alarm, 71, 46);
+    style_tactile_btn(s_btn_clk_alarm, th->card_top, th->lip_shadow, 10);
+    lv_obj_add_event_cb(s_btn_clk_alarm, on_open_alarm_set_click, LV_EVENT_CLICKED, NULL);
+    s_lbl_clk_alarm_btn = lv_label_create(s_btn_clk_alarm);
+    lv_label_set_text(s_lbl_clk_alarm_btn, TR("闹钟", "Alarm"));
+    lv_obj_set_style_text_color(s_lbl_clk_alarm_btn, lv_color_hex(th->text_pri), 0);
+    lv_obj_set_style_text_font(s_lbl_clk_alarm_btn, &ui_font_cjk_14, 0);
+    lv_obj_center(s_lbl_clk_alarm_btn);
 
     refresh_pomo_widgets();
     animate_view_enter(bg, 18, 0, 200);
@@ -4451,7 +5706,7 @@ static void show_calc_view(void)
     lv_obj_clear_flag(disp, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *brand = lv_label_create(disp);
-    lv_label_set_text(brand, "计算器");
+    lv_label_set_text(brand, TR("计算器", "Calculator"));
     lv_obj_set_pos(brand, 10, 5);
     lv_obj_set_style_text_color(brand, lv_color_hex(th->text_mut), 0);
     lv_obj_set_style_text_font(brand, &ui_font_cjk_14, 0);
@@ -4565,38 +5820,38 @@ static void refresh_island_xz_popup_only(const xz_status_t *st)
 
     switch (st->state) {
     case XZ_STATE_CONNECTING:
-        snprintf(tbuf, sizeof(tbuf), "小智 · 连接中...");
-        snprintf(sbuf, sizeof(sbuf), "%.75s", st->status_detail[0] ? st->status_detail : "正在建立语音通道...");
+        snprintf(tbuf, sizeof(tbuf), "%s", TR("小智 · 连接中...", "AI · Connecting..."));
+        snprintf(sbuf, sizeof(sbuf), "%.75s", st->status_detail[0] ? st->status_detail : TR("正在建立语音通道...", "Opening voice link..."));
         break;
     case XZ_STATE_LISTENING:
         if (st->stt_text[0]) {
-            snprintf(tbuf, sizeof(tbuf), "聆听中 · %.60s", st->stt_text);
+            snprintf(tbuf, sizeof(tbuf), TR("聆听中 · %.60s", "Listening · %.60s"), st->stt_text);
         } else {
-            snprintf(tbuf, sizeof(tbuf), "小智正在聆听...");
+            snprintf(tbuf, sizeof(tbuf), "%s", TR("小智正在聆听...", "XiaoZhi Listening..."));
         }
         snprintf(sbuf, sizeof(sbuf), "%.75s",
-                 st->tts_text[0] ? st->tts_text : "请直接说出指令（如：打开时钟 / 播放音乐）");
+                 st->tts_text[0] ? st->tts_text : TR("请直接说出指令（如：打开时钟 / 播放音乐）", "Speak a command (e.g. Open Clock / Play Music)"));
         break;
     case XZ_STATE_SPEAKING:
         snprintf(tbuf, sizeof(tbuf), "%.75s",
-                 st->stt_text[0] ? st->stt_text : "小智正在回复...");
+                 st->stt_text[0] ? st->stt_text : TR("小智正在回复...", "XiaoZhi Speaking..."));
         snprintf(sbuf, sizeof(sbuf), "%.75s",
-                 st->tts_text[0] ? st->tts_text : "小智正在回复...");
+                 st->tts_text[0] ? st->tts_text : TR("小智正在回复...", "XiaoZhi Speaking..."));
         break;
     case XZ_STATE_UNACTIVATED:
-        snprintf(tbuf, sizeof(tbuf), "小智未绑定 · %.15s", st->activation_code);
-        snprintf(sbuf, sizeof(sbuf), "点右侧「全屏」查看绑定引导");
+        snprintf(tbuf, sizeof(tbuf), TR("小智未绑定 · %.15s", "Unbound · %.15s"), st->activation_code);
+        snprintf(sbuf, sizeof(sbuf), "%s", TR("点右侧「全屏」查看绑定引导", "Tap Full on right to bind device"));
         break;
     case XZ_STATE_OFFLINE:
     case XZ_STATE_ERROR:
-        snprintf(tbuf, sizeof(tbuf), "小智 AI");
-        snprintf(sbuf, sizeof(sbuf), "%.75s", st->status_detail[0] ? st->status_detail : "连接异常");
+        snprintf(tbuf, sizeof(tbuf), "%s", TR("小智 AI", "XiaoZhi AI"));
+        snprintf(sbuf, sizeof(sbuf), "%.75s", st->status_detail[0] ? st->status_detail : TR("连接异常", "Connection error"));
         break;
     default:
-        snprintf(tbuf, sizeof(tbuf), "小智 AI");
+        snprintf(tbuf, sizeof(tbuf), "%s", TR("小智 AI", "XiaoZhi AI"));
         snprintf(sbuf, sizeof(sbuf), "%.75s",
                  st->tts_text[0] ? st->tts_text :
-                 (st->status_detail[0] ? st->status_detail : "待命中 · 喊「你好小智」唤醒"));
+                 (st->status_detail[0] ? st->status_detail : TR("待命中 · 喊「你好小智」唤醒", "Ready · Say wake word")));
         break;
     }
 
@@ -4658,9 +5913,9 @@ static void refresh_dynamic_island(void)
     int8_t mode = xz_active ? 4 : (playing ? 1 : (paused ? 2 : (s_pomo_running ? 3 : 0)));
     char pill_txt[96] = {0};
     if (mode == 4) {
-        if (s_isl_xz_st.state == XZ_STATE_SPEAKING) snprintf(pill_txt, sizeof(pill_txt), "小智回复中");
-        else if (s_isl_xz_st.state == XZ_STATE_CONNECTING) snprintf(pill_txt, sizeof(pill_txt), "小智连接中");
-        else snprintf(pill_txt, sizeof(pill_txt), "小智聆听中");
+        if (s_isl_xz_st.state == XZ_STATE_SPEAKING) snprintf(pill_txt, sizeof(pill_txt), "%s", TR("小智回复中", "AI Speaking"));
+        else if (s_isl_xz_st.state == XZ_STATE_CONNECTING) snprintf(pill_txt, sizeof(pill_txt), "%s", TR("小智连接中", "AI Linking"));
+        else snprintf(pill_txt, sizeof(pill_txt), "%s", TR("小智聆听中", "AI Listen"));
     } else if (mode == 1) {
         snprintf(pill_txt, sizeof(pill_txt), "%s", title[0] ? title : "");
     } else if (mode == 2) {
@@ -4754,8 +6009,8 @@ static void refresh_dynamic_island(void)
     s_cache_isl_mode = mode;
 
     if (s_island_popup && !s_island_is_xz) {
-        const char *it = (playing || paused) ? (title[0] ? title : "音乐")
-                                             : (s_pomo_running ? "时钟" : "音乐");
+        const char *it = (playing || paused) ? (title[0] ? title : TR("音乐", "Music"))
+                                             : (s_pomo_running ? TR("时钟", "Clock") : TR("音乐", "Music"));
         if (s_isl_title && strcmp(it, s_cache_isl_title) != 0) {
             snprintf(s_cache_isl_title, sizeof(s_cache_isl_title), "%s", it);
             lv_label_set_text(s_isl_title, it);
@@ -4870,7 +6125,7 @@ static void open_island_xz_popup(void)
     lv_obj_set_style_pad_all(b_full, 0, 0);
     lv_obj_add_event_cb(b_full, on_isl_xz_expand_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lf = lv_label_create(b_full);
-    lv_label_set_text(lf, "全屏");
+    lv_label_set_text(lf, TR("全屏", "Full"));
     lv_obj_set_style_text_color(lf, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(lf, &ui_font_cjk_14, 0);
     lv_obj_center(lf);
@@ -4994,7 +6249,7 @@ static void toggle_island_popup(void)
 
     s_isl_sub = lv_label_create(s_island_popup);
     lv_obj_set_pos(s_isl_sub, 52, 26);
-    lv_obj_set_width(s_isl_sub, 104);
+    lv_obj_set_size(s_isl_sub, 104, 18);
     lv_label_set_long_mode(s_isl_sub, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(s_isl_sub, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(s_isl_sub, &ui_font_cjk_14, 0);
@@ -5079,18 +6334,18 @@ static void refresh_cc_tiles(void)
         lv_obj_set_style_border_color(s_cc_wifi_tile, lv_color_hex(s_wifi_connected ? th->accent : th->card_border), 0);
     }
     if (s_cc_wifi_lbl) {
-        lv_label_set_text(s_cc_wifi_lbl, s_wifi_connected ? (s_wifi_ssid[0] ? s_wifi_ssid : "已连接") : "Wi-Fi");
+        lv_label_set_text(s_cc_wifi_lbl, s_wifi_connected ? (s_wifi_ssid[0] ? s_wifi_ssid : TR("已连接", "Online")) : "Wi-Fi");
         lv_obj_set_style_text_color(s_cc_wifi_lbl, lv_color_hex(s_wifi_connected ? 0xFFFFFFU : th->text_pri), 0);
     }
     if (s_cc_theme_lbl) {
-        lv_label_set_text(s_cc_theme_lbl, th->name);
+        lv_label_set_text(s_cc_theme_lbl, theme_display_name(s_theme_idx));
     }
     if (s_cc_music_tile) {
         lv_obj_set_style_bg_color(s_cc_music_tile, lv_color_hex(playing ? 0xFF2D55U : th->card_top), 0);
         lv_obj_set_style_border_color(s_cc_music_tile, lv_color_hex(playing ? 0xFF2D55U : th->card_border), 0);
     }
     if (s_cc_music_lbl) {
-        lv_label_set_text(s_cc_music_lbl, playing ? "暂停音乐" : "播放音乐");
+        lv_label_set_text(s_cc_music_lbl, playing ? TR("暂停音乐", "Pause") : TR("播放音乐", "Play"));
         lv_obj_set_style_text_color(s_cc_music_lbl, lv_color_hex(playing ? 0xFFFFFFU : th->text_pri), 0);
     }
     if (s_cc_pomo_tile) {
@@ -5100,7 +6355,7 @@ static void refresh_cc_tiles(void)
     if (s_cc_pomo_lbl) {
         char pbuf[20];
         if (s_pomo_running) snprintf(pbuf, sizeof(pbuf), "%02d:%02d", s_pomo_sec / 60, s_pomo_sec % 60);
-        else snprintf(pbuf, sizeof(pbuf), "番茄专注");
+        else snprintf(pbuf, sizeof(pbuf), "%s", TR("番茄专注", "Focus"));
         lv_label_set_text(s_cc_pomo_lbl, pbuf);
         lv_obj_set_style_text_color(s_cc_pomo_lbl, lv_color_hex(s_pomo_running ? 0xFFFFFFU : th->text_pri), 0);
     }
@@ -5154,7 +6409,7 @@ static void on_cc_theme_click(lv_event_t *e)
     else if (s_cur_view == VIEW_SETTINGS) show_settings_view();
     show_control_center_overlay();
     char msg[48];
-    snprintf(msg, sizeof(msg), "主题: %s", T()->name);
+    snprintf(msg, sizeof(msg), TR("主题: %s", "Theme: %s"), theme_display_name(s_theme_idx));
     show_toast_internal(msg);
 }
 
@@ -5173,9 +6428,12 @@ static void on_cc_music_click(lv_event_t *e)
 static void on_cc_pomo_click(lv_event_t *e)
 {
     (void)e;
+    if (!s_pomo_running && s_pomo_sec <= 0) {
+        s_pomo_sec = s_pomo_total_sec;
+    }
     s_pomo_running = !s_pomo_running;
     if (s_pomo_running) {
-        bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", "番茄时钟", VIEW_CLOCK);
+        bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
     } else {
         bg_task_remove_match(BG_KIND_BUILTIN, "os.clock", VIEW_CLOCK);
     }
@@ -5194,7 +6452,7 @@ static void on_cc_bri_slider(lv_event_t *e)
     bsp_display_brightness_set(v);
     if (s_cc_bri_lbl) {
         char buf[24];
-        snprintf(buf, sizeof(buf), "亮度 %d%%", v);
+        snprintf(buf, sizeof(buf), TR("亮度 %d%%", "Bri %d%%"), v);
         lv_label_set_text(s_cc_bri_lbl, buf);
     }
 }
@@ -5206,7 +6464,7 @@ static void on_cc_vol_slider(lv_event_t *e)
     audio_set_volume((uint8_t)v);
     if (s_cc_vol_lbl) {
         char buf[24];
-        snprintf(buf, sizeof(buf), "音量 %d%%", v);
+        snprintf(buf, sizeof(buf), TR("音量 %d%%", "Vol %d%%"), v);
         lv_label_set_text(s_cc_vol_lbl, buf);
     }
 }
@@ -5240,7 +6498,7 @@ static lv_obj_t *create_cc_toggle_tile(lv_obj_t *parent, lv_coord_t x, lv_coord_
 
     lv_obj_t *l = lv_label_create(b);
     lv_label_set_text(l, txt);
-    lv_obj_set_width(l, 64);
+    lv_obj_set_size(l, 66, 18);
     lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(th->text_pri), 0);
@@ -5278,16 +6536,16 @@ static void show_control_center_overlay(void)
     }
 
     lv_obj_t *title = lv_label_create(s_cc_overlay);
-    lv_label_set_text(title, "控制中心");
+    lv_label_set_text(title, TR("控制中心", "Control"));
     lv_obj_set_pos(title, 10, 8);
     lv_obj_set_style_text_color(title, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(title, &ui_font_cjk_14, 0);
 
     lv_obj_t *ip_lbl = lv_label_create(s_cc_overlay);
     if (s_wifi_connected && s_wifi_ip[0]) lv_label_set_text(ip_lbl, s_wifi_ip);
-    else lv_label_set_text(ip_lbl, "高斯毛玻璃浮层");
+    else lv_label_set_text(ip_lbl, TR("高斯毛玻璃浮层", "Quick Controls"));
     lv_obj_set_pos(ip_lbl, 82, 8);
-    lv_obj_set_width(ip_lbl, 152);
+    lv_obj_set_size(ip_lbl, 152, 18);
     lv_label_set_long_mode(ip_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(ip_lbl, lv_color_hex(s_wifi_connected ? th->muted_ok : th->text_sec), 0);
     lv_obj_set_style_text_font(ip_lbl, &ui_font_cjk_14, 0);
@@ -5298,7 +6556,7 @@ static void show_control_center_overlay(void)
     style_glass_card(btn_up, 12, LV_OPA_80, false);
     lv_obj_add_event_cb(btn_up, on_cc_close_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lup = lv_label_create(btn_up);
-    lv_label_set_text(lup, "收起");
+    lv_label_set_text(lup, TR("收起", "Close"));
     lv_obj_set_style_text_color(lup, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(lup, &ui_font_cjk_14, 0);
     lv_obj_center(lup);
@@ -5306,11 +6564,11 @@ static void show_control_center_overlay(void)
     /* Left 2x2 Quick Toggles (x=8, y=36, w=148, h=154) */
     s_cc_wifi_tile = create_cc_toggle_tile(s_cc_overlay, 8, 36, LV_SYMBOL_WIFI, "Wi-Fi",
                                            on_cc_wifi_click, &s_cc_wifi_lbl);
-    create_cc_toggle_tile(s_cc_overlay, 85, 36, LV_SYMBOL_EYE_OPEN, th->name,
+    create_cc_toggle_tile(s_cc_overlay, 85, 36, LV_SYMBOL_EYE_OPEN, theme_display_name(s_theme_idx),
                           on_cc_theme_click, &s_cc_theme_lbl);
-    s_cc_music_tile = create_cc_toggle_tile(s_cc_overlay, 8, 116, LV_SYMBOL_AUDIO, "音乐",
+    s_cc_music_tile = create_cc_toggle_tile(s_cc_overlay, 8, 116, LV_SYMBOL_AUDIO, TR("音乐", "Music"),
                                             on_cc_music_click, &s_cc_music_lbl);
-    s_cc_pomo_tile = create_cc_toggle_tile(s_cc_overlay, 85, 116, LV_SYMBOL_BELL, "番茄专注",
+    s_cc_pomo_tile = create_cc_toggle_tile(s_cc_overlay, 85, 116, LV_SYMBOL_BELL, TR("番茄专注", "Focus"),
                                            on_cc_pomo_click, &s_cc_pomo_lbl);
 
     /* Right Sliders & Telemetry Card (x=162, y=36, w=150, h=154) */
@@ -5323,7 +6581,7 @@ static void show_control_center_overlay(void)
 
     int bri = bsp_display_brightness_get();
     char bbuf[24];
-    snprintf(bbuf, sizeof(bbuf), "亮度 %d%%", bri);
+    snprintf(bbuf, sizeof(bbuf), TR("亮度 %d%%", "Bri %d%%"), bri);
     s_cc_bri_lbl = lv_label_create(rcard);
     lv_label_set_text(s_cc_bri_lbl, bbuf);
     lv_obj_set_pos(s_cc_bri_lbl, 2, 0);
@@ -5341,7 +6599,7 @@ static void show_control_center_overlay(void)
 
     int vol = audio_get_volume();
     char vbuf[24];
-    snprintf(vbuf, sizeof(vbuf), "音量 %d%%", vol);
+    snprintf(vbuf, sizeof(vbuf), TR("音量 %d%%", "Vol %d%%"), vol);
     s_cc_vol_lbl = lv_label_create(rcard);
     lv_label_set_text(s_cc_vol_lbl, vbuf);
     lv_obj_set_pos(s_cc_vol_lbl, 2, 42);
@@ -5359,7 +6617,7 @@ static void show_control_center_overlay(void)
 
     uint32_t f_psram = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U);
     char mbuf[32];
-    snprintf(mbuf, sizeof(mbuf), "内存 %u.%u / 8M", (unsigned)(f_psram / 1024U),
+    snprintf(mbuf, sizeof(mbuf), TR("内存 %u.%u / 8M", "RAM %u.%u / 8M"), (unsigned)(f_psram / 1024U),
              (unsigned)((f_psram % 1024U) * 10U / 1024U));
     s_cc_mem_lbl = lv_label_create(rcard);
     lv_label_set_text(s_cc_mem_lbl, mbuf);
@@ -5385,7 +6643,7 @@ static void show_control_center_overlay(void)
     lv_obj_set_style_shadow_width(btn_rec, 0, 0);
     lv_obj_add_event_cb(btn_rec, on_cc_recents_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lrec = lv_label_create(btn_rec);
-    lv_label_set_text(lrec, "打开多任务卡片");
+    lv_label_set_text(lrec, TR("打开多任务卡片", "Open Recents"));
     lv_obj_set_style_text_color(lrec, lv_color_hex(th->accent), 0);
     lv_obj_set_style_text_font(lrec, &ui_font_cjk_14, 0);
     lv_obj_center(lrec);
@@ -5397,7 +6655,7 @@ static void show_control_center_overlay(void)
     style_glass_card(btn_bar, 13, LV_OPA_70, false);
     lv_obj_add_event_cb(btn_bar, on_cc_close_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbar = lv_label_create(btn_bar);
-    lv_label_set_text(lbar, "上滑或点此收起");
+    lv_label_set_text(lbar, TR("上滑或点此收起", "Tap to Close"));
     lv_obj_set_style_text_color(lbar, lv_color_hex(th->text_sec), 0);
     lv_obj_set_style_text_font(lbar, &ui_font_cjk_14, 0);
     lv_obj_center(lbar);
@@ -5414,7 +6672,7 @@ static void kill_bg_task_by_index(int idx, bool refresh_ui)
     if (idx < 0 || idx >= MAX_BG_TASKS || !s_bg_tasks[idx].active) return;
     bg_task_t t = s_bg_tasks[idx];
     if (strcmp(t.id, OS_SYSTEM_APP_XIAOZHI_ID) == 0) {
-        show_toast_internal("小智 AI 为系统守护服务，不可结束");
+        show_toast_internal(TR("小智 AI 为系统守护服务，不可结束", "XiaoZhi AI is a protected daemon"));
         return;
     }
     bg_task_remove_at(idx);
@@ -5442,7 +6700,7 @@ static void kill_bg_task_by_index(int idx, bool refresh_ui)
     } else if (t.kind == BG_KIND_BUILTIN) {
         if (t.builtin_view == VIEW_CLOCK) {
             s_pomo_running = false;
-            s_pomo_sec = 25 * 60;
+            s_pomo_sec = s_pomo_total_sec;
         }
         if (s_cur_view == t.builtin_view ||
             (t.builtin_view == VIEW_FILES && s_cur_view == VIEW_IMAGE_PREVIEW)) {
@@ -5471,7 +6729,7 @@ static void on_bg_kill_all_click(lv_event_t *e)
     }
     close_bg_mgr_overlay(false);
     show_home_view();
-    show_toast_internal("已清理普通后台应用（系统守护保留）");
+    show_toast_internal(TR("已清理普通后台应用（系统守护保留）", "Cleared background apps"));
 }
 
 static void on_bg_task_kill_click(lv_event_t *e)
@@ -5561,7 +6819,7 @@ static void show_bg_mgr_overlay(void)
             }
         }
         if (!has_music) {
-            bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", "G'lam 音乐", VIEW_MUSIC_APP);
+            bg_task_register(BG_KIND_MUSIC, BG_POLICY_PARTIAL_SVC, "com.glam.music", TR("G'lam 音乐", "G'lam Music"), VIEW_MUSIC_APP);
         }
     }
 
@@ -5586,13 +6844,13 @@ static void show_bg_mgr_overlay(void)
     }
 
     lv_obj_t *title = lv_label_create(s_bg_mgr_overlay);
-    lv_label_set_text(title, "多任务卡片");
+    lv_label_set_text(title, TR("多任务卡片", "Recents"));
     lv_obj_set_pos(title, 10, 8);
     lv_obj_set_style_text_color(title, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(title, &ui_font_cjk_14, 0);
 
     char mem_buf[48];
-    snprintf(mem_buf, sizeof(mem_buf), "可用 %u KB",
+    snprintf(mem_buf, sizeof(mem_buf), TR("可用 %u KB", "Free %u KB"),
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U));
     lv_obj_t *lbl_mem = lv_label_create(s_bg_mgr_overlay);
     lv_label_set_text(lbl_mem, mem_buf);
@@ -5608,7 +6866,7 @@ static void show_bg_mgr_overlay(void)
     lv_obj_set_style_shadow_width(btn_clear, 0, 0);
     lv_obj_add_event_cb(btn_clear, on_bg_kill_all_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lc = lv_label_create(btn_clear);
-    lv_label_set_text(lc, "全部清理");
+    lv_label_set_text(lc, TR("全部清理", "Clear All"));
     lv_obj_set_style_text_color(lc, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(lc, &ui_font_cjk_14, 0);
     lv_obj_center(lc);
@@ -5619,7 +6877,7 @@ static void show_bg_mgr_overlay(void)
     style_glass_card(btn_close, 10, LV_OPA_80, false);
     lv_obj_add_event_cb(btn_close, on_bg_close_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lx = lv_label_create(btn_close);
-    lv_label_set_text(lx, "返回");
+    lv_label_set_text(lx, TR("返回", "Back"));
     lv_obj_set_style_text_color(lx, lv_color_hex(th->text_pri), 0);
     lv_obj_set_style_text_font(lx, &ui_font_cjk_14, 0);
     lv_obj_center(lx);
@@ -5676,7 +6934,7 @@ static void show_bg_mgr_overlay(void)
         lv_obj_t *ln = lv_label_create(card);
         lv_label_set_text(ln, s_bg_tasks[i].name);
         lv_obj_set_pos(ln, 38, 13);
-        lv_obj_set_width(ln, 94);
+        lv_obj_set_size(ln, 94, 18);
         lv_label_set_long_mode(ln, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_color(ln, lv_color_hex(th->text_pri), 0);
         lv_obj_set_style_text_font(ln, &ui_font_cjk_14, 0);
@@ -5691,19 +6949,19 @@ static void show_bg_mgr_overlay(void)
 
         char status_txt[64];
         if (is_xz_sys) {
-            snprintf(status_txt, sizeof(status_txt), "系统最高权限\n语音唤醒常驻\n点击打开界面");
+            snprintf(status_txt, sizeof(status_txt), "%s", TR("系统最高权限\n语音唤醒常驻\n点击打开界面", "System Core\nWake Word ON\nTap to Open"));
         } else if (s_bg_tasks[i].kind == BG_KIND_MUSIC) {
-            snprintf(status_txt, sizeof(status_txt), "%s\n仅留后台音频\n点击切回前台",
-                     audio_is_playing() ? "正在播放" :
-                     (audio_get_state() == BSP_AUDIO_STATE_PAUSED ? "已暂停" : "待命"));
+            snprintf(status_txt, sizeof(status_txt), TR("%s\n仅留后台音频\n点击切回前台", "%s\nBG Audio\nTap to Open"),
+                     audio_is_playing() ? TR("正在播放", "Playing") :
+                     (audio_get_state() == BSP_AUDIO_STATE_PAUSED ? TR("已暂停", "Paused") : TR("待命", "Idle")));
         } else if (s_bg_tasks[i].kind == BG_KIND_ELF) {
-            snprintf(status_txt, sizeof(status_txt), "完整挂起\n占 %u KB\n点击恢复",
+            snprintf(status_txt, sizeof(status_txt), TR("完整挂起\n占 %u KB\n点击恢复", "Suspended\n%u KB RAM\nTap to Resume"),
                      (unsigned)((s_active_elf.alloc_size + 1023U) / 1024U));
         } else if (s_bg_tasks[i].builtin_view == VIEW_CLOCK && s_pomo_running) {
-            snprintf(status_txt, sizeof(status_txt), "番茄倒计时\n%02d:%02d\n点击查看",
+            snprintf(status_txt, sizeof(status_txt), TR("番茄倒计时\n%02d:%02d\n点击查看", "Pomodoro\n%02d:%02d\nTap to View"),
                      s_pomo_sec / 60, s_pomo_sec % 60);
         } else {
-            snprintf(status_txt, sizeof(status_txt), "后台挂起\n点击切回");
+            snprintf(status_txt, sizeof(status_txt), "%s", TR("后台挂起\n点击切回", "Background\nTap to Open"));
         }
 
         lv_obj_t *ls = lv_label_create(btn_go);
@@ -5727,7 +6985,7 @@ static void show_bg_mgr_overlay(void)
             lv_obj_add_event_cb(btn_end, on_bg_task_kill_click, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         }
         lv_obj_t *le = lv_label_create(btn_end);
-        lv_label_set_text(le, is_xz_sys ? "系统常驻守护" : "结束任务");
+        lv_label_set_text(le, is_xz_sys ? TR("系统常驻守护", "System Daemon") : TR("结束任务", "Close"));
         lv_obj_set_style_text_color(le, lv_color_hex(is_xz_sys ? 0x14B8A6U : th->accent), 0);
         lv_obj_set_style_text_font(le, &ui_font_cjk_14, 0);
         lv_obj_center(le);
@@ -5738,7 +6996,8 @@ static void show_bg_mgr_overlay(void)
         lv_obj_set_size(ecard, 290, 130);
         style_glass_card(ecard, 16, LV_OPA_80, false);
         lv_obj_t *empty = lv_label_create(ecard);
-        lv_label_set_text(empty, "暂无后台运行的应用\n顶部下滑呼出控制中心 · 底部上滑多任务");
+        lv_label_set_text(empty, TR("暂无后台运行的应用\n顶部下滑呼出控制中心 · 底部上滑多任务",
+                                    "No recent apps.\nSwipe down for Control · Swipe up for Recents"));
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(empty, lv_color_hex(th->text_sec), 0);
         lv_obj_set_style_text_font(empty, &ui_font_cjk_14, 0);
@@ -5912,15 +7171,30 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
 
     if (do_pomo) {
         if (req_pomo_act == 1) {
-            if (req_pomo_min > 0) s_pomo_sec = req_pomo_min * 60;
-            else if (s_pomo_sec <= 0) s_pomo_sec = 25 * 60;
+            if (req_pomo_min > 0) {
+                s_pomo_total_sec = req_pomo_min * 60;
+                if (s_pomo_total_sec > 7200) s_pomo_total_sec = 7200;
+                s_pomo_sec = s_pomo_total_sec;
+                save_clock_prefs();
+            } else if (s_pomo_sec <= 0) {
+                s_pomo_sec = s_pomo_total_sec;
+            }
+            if (s_alarm_ring_mode != 0) stop_alarm_ring();
             s_pomo_running = true;
-            bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock", "番茄时钟", VIEW_CLOCK);
+            bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC, "os.clock",
+                             TR("番茄时钟", "Pomodoro"), VIEW_CLOCK);
         } else if (req_pomo_act == 2) {
             s_pomo_running = false;
+            if (s_alarm_ring_mode != 0) stop_alarm_ring();
         } else if (req_pomo_act == 3) {
             s_pomo_running = false;
-            s_pomo_sec = (req_pomo_min > 0) ? (req_pomo_min * 60) : (25 * 60);
+            if (s_alarm_ring_mode != 0) stop_alarm_ring();
+            if (req_pomo_min > 0) {
+                s_pomo_total_sec = req_pomo_min * 60;
+                if (s_pomo_total_sec > 7200) s_pomo_total_sec = 7200;
+                save_clock_prefs();
+            }
+            s_pomo_sec = s_pomo_total_sec;
         }
         if (s_cur_view == VIEW_CLOCK) {
             refresh_pomo_widgets();
@@ -5931,7 +7205,7 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
         bsp_display_brightness_set(req_bri_val);
         if (s_lbl_bri) {
             char bbuf[24];
-            snprintf(bbuf, sizeof(bbuf), "亮度 %d%%", req_bri_val);
+            snprintf(bbuf, sizeof(bbuf), TR("亮度 %d%%", "Bri %d%%"), req_bri_val);
             lv_label_set_text(s_lbl_bri, bbuf);
         }
     }
@@ -5944,7 +7218,7 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
         else if (s_cur_view == VIEW_SETTINGS) show_settings_view();
         else if (s_cur_view == VIEW_XIAOZHI) show_xiaozhi_view();
         char tmsg[48];
-        snprintf(tmsg, sizeof(tmsg), "主题已切换: %s", T()->name);
+        snprintf(tmsg, sizeof(tmsg), TR("主题已切换: %s", "Theme: %s"), theme_display_name(s_theme_idx));
         show_toast_internal(tmsg);
     }
 
@@ -6003,6 +7277,9 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
             }
             show_home_view();
         }
+    } else if (do_home && s_alarm_ring_mode != 0) {
+        stop_alarm_ring();
+        show_toast_internal(TR("已关闭闹铃", "Alarm stopped"));
     } else if (do_home && s_cur_view == VIEW_HOME && s_home_edit_mode) {
         close_slot_modal();
         cancel_home_drag();
@@ -6044,7 +7321,7 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
             const os_theme_t *th = T();
             char sbuf[112];
             if (s_wifi_connected) {
-                snprintf(sbuf, sizeof(sbuf), "已连接 %s (%s)", s_wifi_ssid, s_wifi_ip);
+                snprintf(sbuf, sizeof(sbuf), TR("已连接 %s (%s)", "Connected %s (%s)"), s_wifi_ssid, s_wifi_ip);
                 lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->muted_ok), 0);
                 lv_label_set_text(s_wf_lbl_status, sbuf);
                 if (s_wifi_connecting) {
@@ -6052,7 +7329,8 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
                 }
             } else {
                 snprintf(sbuf, sizeof(sbuf), "%s",
-                         wifi_reason_copy[0] ? wifi_reason_copy : "未连接，请选择网络或输入名称");
+                         wifi_reason_copy[0] ? wifi_reason_copy
+                                             : TR("未连接，请选择网络或输入名称", "Disconnected. Select or enter SSID"));
                 lv_obj_set_style_text_color(s_wf_lbl_status, lv_color_hex(th->accent), 0);
                 lv_label_set_text(s_wf_lbl_status, sbuf);
             }
@@ -6111,7 +7389,7 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
         if (s_cc_overlay) {
             if (s_cc_mem_lbl) {
                 char mbuf[32];
-                snprintf(mbuf, sizeof(mbuf), "内存 %u.%u / 8M", (unsigned)(f_psram / 1024U),
+                snprintf(mbuf, sizeof(mbuf), TR("内存 %u.%u / 8M", "RAM %u.%u / 8M"), (unsigned)(f_psram / 1024U),
                          (unsigned)((f_psram % 1024U) * 10U / 1024U));
                 lv_label_set_text(s_cc_mem_lbl, mbuf);
             }
@@ -6122,8 +7400,8 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
         if (s_cur_view == VIEW_SETTINGS && s_lbl_set_psram && s_bar_set_psram &&
             s_lbl_set_sram && s_bar_set_sram) {
             char pb[28], sb[28];
-            snprintf(pb, sizeof(pb), "扩展内存 %uK", (unsigned)f_psram);
-            snprintf(sb, sizeof(sb), "高速缓存 %uK", (unsigned)f_sram);
+            snprintf(pb, sizeof(pb), TR("扩展内存 %uK", "PSRAM %uK"), (unsigned)f_psram);
+            snprintf(sb, sizeof(sb), TR("高速缓存 %uK", "SRAM %uK"), (unsigned)f_sram);
             lv_label_set_text(s_lbl_set_psram, pb);
             lv_bar_set_value(s_bar_set_psram, (int32_t)f_psram, LV_ANIM_OFF);
             lv_label_set_text(s_lbl_set_sram, sb);
@@ -6144,7 +7422,18 @@ static void os_ui_poll_timer_cb(lv_timer_t *t)
             if (s_pomo_sec == 0) {
                 s_pomo_running = false;
                 bg_task_remove_match(BG_KIND_BUILTIN, "os.clock", VIEW_CLOCK);
-                show_toast_internal("番茄钟时间到!");
+                trigger_alarm_ring(1);
+            }
+        }
+        if (s_alarm_enabled && tm_info.tm_year > (2020 - 1900)) {
+            if (tm_info.tm_hour == (int)s_alarm_hour &&
+                tm_info.tm_min == (int)s_alarm_min &&
+                tm_info.tm_sec <= 3) {
+                int32_t fire_key = tm_info.tm_yday * 1440 + tm_info.tm_hour * 60 + tm_info.tm_min;
+                if (fire_key != s_alarm_last_fired_key) {
+                    s_alarm_last_fired_key = fire_key;
+                    trigger_alarm_ring(2);
+                }
             }
         }
         if (s_cc_overlay) refresh_cc_tiles();
@@ -6216,6 +7505,7 @@ static void apply_chrome_theme_styles(void)
 esp_err_t os_ui_init(void)
 {
     load_saved_theme();
+    load_clock_prefs();
     swift_os_abi_init(os_ui_request_home, os_ui_post_toast, &ui_font_cjk_14,
                       hub_player_start_or_show, hub_player_hide_to_os);
 
@@ -6293,7 +7583,7 @@ esp_err_t os_ui_init(void)
 
     s_audio_pill_lbl = lv_label_create(s_lbl_audio_pill);
     lv_label_set_text(s_audio_pill_lbl, "");
-    lv_obj_set_width(s_audio_pill_lbl, 94);
+    lv_obj_set_size(s_audio_pill_lbl, 94, 18);
     lv_label_set_long_mode(s_audio_pill_lbl, LV_LABEL_LONG_DOT);
     lv_obj_align(s_audio_pill_lbl, LV_ALIGN_LEFT_MID, 23, 0);
     lv_obj_set_style_text_font(s_audio_pill_lbl, &ui_font_cjk_14, 0);
@@ -6346,11 +7636,11 @@ esp_err_t os_ui_init(void)
     lv_obj_set_style_pad_all(s_btn_edit_done, 0, 0);
     lv_obj_set_ext_click_area(s_btn_edit_done, 8);
     lv_obj_add_event_cb(s_btn_edit_done, on_edit_done_click, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *l_done = lv_label_create(s_btn_edit_done);
-    lv_label_set_text(l_done, "完成");
-    lv_obj_set_style_text_color(l_done, lv_color_hex(0xFFFFFFU), 0);
-    lv_obj_set_style_text_font(l_done, &ui_font_cjk_14, 0);
-    lv_obj_center(l_done);
+    s_lbl_edit_done = lv_label_create(s_btn_edit_done);
+    lv_label_set_text(s_lbl_edit_done, TR("完成", "Done"));
+    lv_obj_set_style_text_color(s_lbl_edit_done, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(s_lbl_edit_done, &ui_font_cjk_14, 0);
+    lv_obj_center(s_lbl_edit_done);
     lv_obj_add_flag(s_btn_edit_done, LV_OBJ_FLAG_HIDDEN);
 
     /* Top-Right Sleek Glass Back-Home Pill (Shown Inside Apps) */
@@ -6374,7 +7664,7 @@ esp_err_t os_ui_init(void)
     lv_obj_set_style_text_font(home_sym, &lv_font_montserrat_12, 0);
 
     s_lbl_home_btn = lv_label_create(s_btn_home);
-    lv_label_set_text(s_lbl_home_btn, "桌面");
+    lv_label_set_text(s_lbl_home_btn, TR("桌面", "Home"));
     lv_obj_set_style_text_color(s_lbl_home_btn, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(s_lbl_home_btn, &ui_font_cjk_14, 0);
     lv_obj_add_flag(s_btn_home, LV_OBJ_FLAG_HIDDEN);
@@ -6404,7 +7694,7 @@ esp_err_t os_ui_init(void)
     apply_chrome_theme_styles();
     /* Register persistent highest-privilege XiaoZhi AI voice daemon on boot */
     bg_task_register(BG_KIND_BUILTIN, BG_POLICY_PARTIAL_SVC,
-                     OS_SYSTEM_APP_XIAOZHI_ID, "小智 AI", VIEW_XIAOZHI);
+                     OS_SYSTEM_APP_XIAOZHI_ID, TR("小智 AI", "XiaoZhi AI"), VIEW_XIAOZHI);
     show_home_view();
     refresh_dynamic_island();
     lv_obj_move_foreground(s_gesture_pill);
@@ -6535,13 +7825,13 @@ void os_ui_show_no_tf_shutdown(void)
         lv_obj_center(sym);
 
         lv_obj_t *title = lv_label_create(card);
-        lv_label_set_text(title, "未检测到 TF 卡");
+        lv_label_set_text(title, TR("未检测到 TF 卡", "No TF Card"));
         lv_obj_set_pos(title, 100, 22);
         lv_obj_set_style_text_color(title, lv_color_hex(0xF8FAFCU), 0);
         lv_obj_set_style_text_font(title, &ui_font_cjk_14, 0);
 
         lv_obj_t *msg = lv_label_create(card);
-        lv_label_set_text(msg, "无法进入系统，请插入TF卡后重启。");
+        lv_label_set_text(msg, TR("无法进入系统，请插入TF卡后重启。", "Insert TF card and reboot."));
         lv_obj_set_width(msg, 236);
         lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
@@ -6550,7 +7840,7 @@ void os_ui_show_no_tf_shutdown(void)
         lv_obj_set_style_text_font(msg, &ui_font_cjk_14, 0);
 
         lbl_cnt = lv_label_create(card);
-        lv_label_set_text(lbl_cnt, "5 秒后自动关机");
+        lv_label_set_text(lbl_cnt, TR("5 秒后自动关机", "Power off in 5s"));
         lv_obj_align(lbl_cnt, LV_ALIGN_TOP_MID, 0, 94);
         lv_obj_set_style_text_color(lbl_cnt, lv_color_hex(0xF87171U), 0);
         lv_obj_set_style_text_font(lbl_cnt, &ui_font_cjk_14, 0);
@@ -6564,7 +7854,7 @@ void os_ui_show_no_tf_shutdown(void)
         lv_obj_set_style_shadow_width(btn, 0, 0);
         lv_obj_add_event_cb(btn, on_no_tf_shutdown_click, LV_EVENT_CLICKED, NULL);
         lv_obj_t *blbl = lv_label_create(btn);
-        lv_label_set_text(blbl, "立即关机");
+        lv_label_set_text(blbl, TR("立即关机", "Shut Down"));
         lv_obj_set_style_text_color(blbl, lv_color_hex(0xFFFFFFU), 0);
         lv_obj_set_style_text_font(blbl, &ui_font_cjk_14, 0);
         lv_obj_center(blbl);
@@ -6575,7 +7865,7 @@ void os_ui_show_no_tf_shutdown(void)
     for (int sec = 5; sec > 0 && !s_no_tf_shutdown_now; sec--) {
         if (lbl_cnt && lvgl_port_lock(200)) {
             char buf[32];
-            snprintf(buf, sizeof(buf), "%d 秒后自动关机", sec);
+            snprintf(buf, sizeof(buf), TR("%d 秒后自动关机", "Power off in %ds"), sec);
             lv_label_set_text(lbl_cnt, buf);
             lvgl_port_unlock();
         }
@@ -6585,4 +7875,174 @@ void os_ui_show_no_tf_shutdown(void)
     }
 
     bsp_system_shutdown();
+}
+
+/* ========================================================================= */
+/*               First-Boot Language Selection Wizard (OOBE)                 */
+/* ========================================================================= */
+
+static volatile bool s_oobe_done = false;
+static os_lang_t s_oobe_lang = OS_LANG_ZH;
+static lv_obj_t *s_oobe_cards[2] = {NULL, NULL};
+static lv_obj_t *s_oobe_checks[2] = {NULL, NULL};
+static lv_obj_t *s_oobe_btn_lbl = NULL;
+
+static void oobe_refresh_selection(void)
+{
+    for (int i = 0; i < 2; i++) {
+        bool sel = ((int)s_oobe_lang == i);
+        if (s_oobe_cards[i]) {
+            lv_obj_set_style_bg_color(s_oobe_cards[i], lv_color_hex(sel ? 0x192844U : 0x1A202CU), 0);
+            lv_obj_set_style_border_color(s_oobe_cards[i], lv_color_hex(sel ? 0x2E7CF6U : 0x2C3445U), 0);
+            lv_obj_set_style_border_width(s_oobe_cards[i], sel ? 2 : 1, 0);
+        }
+        if (s_oobe_checks[i]) {
+            if (sel) lv_obj_clear_flag(s_oobe_checks[i], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_add_flag(s_oobe_checks[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_oobe_btn_lbl) {
+        lv_label_set_text(s_oobe_btn_lbl,
+                          (s_oobe_lang == OS_LANG_EN) ? "Continue  " LV_SYMBOL_RIGHT
+                                                      : "进入系统  " LV_SYMBOL_RIGHT);
+    }
+}
+
+static void on_oobe_card_click(lv_event_t *e)
+{
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    s_oobe_lang = (idx == 1) ? OS_LANG_EN : OS_LANG_ZH;
+    oobe_refresh_selection();
+}
+
+static void on_oobe_confirm_click(lv_event_t *e)
+{
+    (void)e;
+    s_oobe_done = true;
+}
+
+void os_ui_run_first_boot_lang_select(void)
+{
+    s_oobe_done = false;
+    s_oobe_lang = OS_LANG_ZH;
+    s_oobe_cards[0] = s_oobe_cards[1] = NULL;
+    s_oobe_checks[0] = s_oobe_checks[1] = NULL;
+    s_oobe_btn_lbl = NULL;
+
+    if (!lvgl_port_lock(2000)) {
+        os_i18n_set_lang(OS_LANG_ZH);
+        return;
+    }
+
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0E121BU), 0);
+    lv_obj_set_style_bg_grad_color(scr, lv_color_hex(0x161E2EU), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *brand = lv_label_create(scr);
+    lv_label_set_text(brand, "G'lam OS");
+    lv_obj_align(brand, LV_ALIGN_TOP_MID, 0, 14);
+    lv_obj_set_style_text_color(brand, lv_color_hex(0xF8FAFCU), 0);
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_24, 0);
+
+    lv_obj_t *sub = lv_label_create(scr);
+    lv_label_set_text(sub, "选择系统语言 · Select Language");
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x94A3B8U), 0);
+    lv_obj_set_style_text_font(sub, &ui_font_cjk_14, 0);
+
+    static const struct {
+        const char *badge;
+        const char *title;
+        const char *desc;
+        int x;
+    } k_opts[2] = {
+        { "中", "简体中文", "Chinese", 14 },
+        { "EN", "English",  "英语",    166 },
+    };
+
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *card = lv_obj_create(scr);
+        lv_obj_set_pos(card, k_opts[i].x, 72);
+        lv_obj_set_size(card, 140, 96);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 14, 0);
+        lv_obj_set_style_pad_all(card, 0, 0);
+        lv_obj_set_style_shadow_width(card, 0, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, on_oobe_card_click, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+        s_oobe_cards[i] = card;
+
+        lv_obj_t *pill = lv_obj_create(card);
+        lv_obj_set_size(pill, 40, 26);
+        lv_obj_align(pill, LV_ALIGN_TOP_MID, 0, 12);
+        lv_obj_set_style_bg_color(pill, lv_color_hex(0x2E7CF6U), 0);
+        lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(pill, 0, 0);
+        lv_obj_set_style_radius(pill, 8, 0);
+        lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *pl = lv_label_create(pill);
+        lv_label_set_text(pl, k_opts[i].badge);
+        lv_obj_set_style_text_color(pl, lv_color_hex(0xFFFFFFU), 0);
+        lv_obj_set_style_text_font(pl, &ui_font_cjk_14, 0);
+        lv_obj_center(pl);
+
+        lv_obj_t *chk = lv_label_create(card);
+        lv_label_set_text(chk, LV_SYMBOL_OK);
+        lv_obj_align(chk, LV_ALIGN_TOP_RIGHT, -10, 8);
+        lv_obj_set_style_text_color(chk, lv_color_hex(0x38BDF8U), 0);
+        lv_obj_set_style_text_font(chk, &lv_font_montserrat_14, 0);
+        s_oobe_checks[i] = chk;
+
+        lv_obj_t *tl = lv_label_create(card);
+        lv_label_set_text(tl, k_opts[i].title);
+        lv_obj_align(tl, LV_ALIGN_TOP_MID, 0, 46);
+        lv_obj_set_style_text_color(tl, lv_color_hex(0xF8FAFCU), 0);
+        lv_obj_set_style_text_font(tl, &ui_font_cjk_14, 0);
+
+        lv_obj_t *dl = lv_label_create(card);
+        lv_label_set_text(dl, k_opts[i].desc);
+        lv_obj_align(dl, LV_ALIGN_TOP_MID, 0, 68);
+        lv_obj_set_style_text_color(dl, lv_color_hex(0x94A3B8U), 0);
+        lv_obj_set_style_text_font(dl, &ui_font_cjk_14, 0);
+    }
+
+    lv_obj_t *btn_go = lv_btn_create(scr);
+    lv_obj_set_pos(btn_go, 20, 182);
+    lv_obj_set_size(btn_go, 280, 42);
+    lv_obj_set_style_bg_color(btn_go, lv_color_hex(0x2E7CF6U), 0);
+    lv_obj_set_style_bg_color(btn_go, lv_color_hex(0x1D63D8U), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(btn_go, 12, 0);
+    lv_obj_set_style_border_width(btn_go, 0, 0);
+    lv_obj_set_style_shadow_width(btn_go, 0, 0);
+    lv_obj_set_style_translate_y(btn_go, 1, LV_STATE_PRESSED);
+    lv_obj_add_event_cb(btn_go, on_oobe_confirm_click, LV_EVENT_CLICKED, NULL);
+
+    s_oobe_btn_lbl = lv_label_create(btn_go);
+    lv_obj_set_style_text_color(s_oobe_btn_lbl, lv_color_hex(0xFFFFFFU), 0);
+    lv_obj_set_style_text_font(s_oobe_btn_lbl, &ui_font_cjk_14, 0);
+    lv_obj_center(s_oobe_btn_lbl);
+
+    oobe_refresh_selection();
+    lvgl_port_unlock();
+
+    while (!s_oobe_done) {
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    os_i18n_set_lang(s_oobe_lang);
+    ESP_LOGI(TAG, "First-boot language selected: %s",
+             (s_oobe_lang == OS_LANG_EN) ? "English" : "Chinese");
+
+    if (lvgl_port_lock(2000)) {
+        s_oobe_cards[0] = s_oobe_cards[1] = NULL;
+        s_oobe_checks[0] = s_oobe_checks[1] = NULL;
+        s_oobe_btn_lbl = NULL;
+        lv_obj_clean(lv_scr_act());
+        lvgl_port_unlock();
+    }
 }

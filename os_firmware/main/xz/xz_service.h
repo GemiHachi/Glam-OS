@@ -28,6 +28,12 @@ typedef enum {
     XZ_STATE_ERROR,
 } xz_state_t;
 
+typedef enum {
+    XZ_PC_PERM_FULL = 0,
+    XZ_PC_PERM_PARTIAL = 1,
+    XZ_PC_PERM_ASK_EVERY = 2,
+} xz_pc_perm_mode_t;
+
 typedef struct {
     xz_state_t state;
     bool activated;
@@ -36,6 +42,7 @@ typedef struct {
     bool wakeup_enabled;
     bool wakeup_ready;
     bool overlay_active;
+    xz_pc_perm_mode_t pc_perm_mode;
     uint16_t mic_peak;
     char activation_code[16];
     char activation_msg[128];
@@ -81,6 +88,9 @@ void xz_service_mic_test_start(void);
 
 void xz_service_set_wakeup_enabled(bool enabled);
 bool xz_service_is_wakeup_enabled(void);
+void xz_service_set_pc_perm_mode(xz_pc_perm_mode_t mode);
+xz_pc_perm_mode_t xz_service_get_pc_perm_mode(void);
+const char *xz_service_get_pc_perm_mode_str(void);
 void xz_service_trigger_wakeup(void);
 void xz_service_dismiss_overlay(void);
 
@@ -88,6 +98,7 @@ void xz_service_dismiss_overlay(void);
 void xz_service_schedule_music_handoff(const char *keyword, const char *action);
 
 void xz_service_get_status(xz_status_t *out);
+void xz_service_get_diag_json(char *out, size_t max_len);
 esp_err_t xz_service_set_ota_url(const char *url);
 
 #ifdef __cplusplus

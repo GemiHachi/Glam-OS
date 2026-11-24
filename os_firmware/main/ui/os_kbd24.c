@@ -4,6 +4,7 @@
  */
 
 #include "os_kbd24.h"
+#include "os_i18n.h"
 #include "pinyin_ime_table.h"
 #include "esp_lvgl_port.h"
 #include <stdio.h>
@@ -151,8 +152,14 @@ static void kbd24_cand_click_cb(lv_event_t *e)
 
 static void kbd24_refresh_ime_ui_locked(void)
 {
+    if (s_kbd24_lbl_cancel) {
+        lv_label_set_text(s_kbd24_lbl_cancel, TR("取消", "Back"));
+    }
+    if (s_kbd24_lbl_clear) {
+        lv_label_set_text(s_kbd24_lbl_clear, TR("清空", "Clr"));
+    }
     if (s_kbd24_btn_ime && s_kbd24_lbl_ime) {
-        lv_label_set_text(s_kbd24_lbl_ime, s_kbd24_ime_zh ? "中" : "英");
+        lv_label_set_text(s_kbd24_lbl_ime, s_kbd24_ime_zh ? TR("中", "CN") : TR("英", "EN"));
         lv_obj_set_style_bg_color(s_kbd24_btn_ime,
                                   lv_color_hex(s_kbd24_ime_zh ? s_th.accent : s_th.surface_high), 0);
         lv_obj_set_style_border_color(s_kbd24_btn_ime,
@@ -163,11 +170,11 @@ static void kbd24_refresh_ime_ui_locked(void)
 
     if (s_kbd24_py_lbl) {
         if (!s_kbd24_ime_zh) {
-            lv_label_set_text(s_kbd24_py_lbl, "英文");
+            lv_label_set_text(s_kbd24_py_lbl, TR("英文", "EN"));
         } else if (s_kbd24_py_buf[0]) {
             lv_label_set_text(s_kbd24_py_lbl, s_kbd24_py_buf);
         } else {
-            lv_label_set_text(s_kbd24_py_lbl, "拼音");
+            lv_label_set_text(s_kbd24_py_lbl, TR("拼音", "Pinyin"));
         }
     }
 
@@ -213,12 +220,12 @@ static void kbd24_refresh_ime_ui_locked(void)
         lv_obj_clean(s_kbd24_cand_row);
         if (!s_kbd24_ime_zh) {
             lv_obj_t *hint = lv_label_create(s_kbd24_cand_row);
-            lv_label_set_text(hint, "点右上“英/中”可切换中文拼音");
+            lv_label_set_text(hint, TR("点右上“英/中”可切换中文拼音", "Tap EN/CN at top-right for Pinyin"));
             lv_obj_set_style_text_color(hint, lv_color_hex(s_th.text_mut), 0);
             lv_obj_set_style_text_font(hint, &ui_font_cjk_14, 0);
         } else if (s_kbd24_cand_count == 0) {
             lv_obj_t *hint = lv_label_create(s_kbd24_cand_row);
-            lv_label_set_text(hint, "输入拼音选汉字 (如 zjl / qt)");
+            lv_label_set_text(hint, TR("输入拼音选汉字 (如 zjl / qt)", "Type Pinyin for Chinese (e.g. zjl)"));
             lv_obj_set_style_text_color(hint, lv_color_hex(s_th.text_mut), 0);
             lv_obj_set_style_text_font(hint, &ui_font_cjk_14, 0);
         } else {
@@ -260,18 +267,21 @@ static void kbd24_refresh_keys_locked(void)
         if (!is_ctrl) {
             int cslot = grid_idx_to_char_slot(idx);
             txt = s_kbd24_pages[page][cslot];
+            if (strcmp(txt, "空格") == 0) {
+                txt = TR("空格", "Space");
+            }
         } else {
             if (row == 0) {
-                txt = "退格";
+                txt = TR("退格", "Del");
             } else if (row == 1) {
-                if (page == 0) txt = "数/u-z";
-                else if (page == 1) txt = "字母a-t";
-                else if (page == 2) txt = "符号U-Z";
-                else txt = "字母A-T";
+                if (page == 0) txt = TR("数/u-z", "0-9/z");
+                else if (page == 1) txt = TR("字母a-t", "a-t");
+                else if (page == 2) txt = TR("符号U-Z", "Sym/Z");
+                else txt = TR("字母A-T", "A-T");
             } else if (row == 2) {
-                txt = (page < 2) ? "大写/符" : "小写";
+                txt = (page < 2) ? TR("大写/符", "ABC") : TR("小写", "abc");
             } else {
-                txt = "确定";
+                txt = TR("确定", "OK");
                 is_accent = true;
             }
         }
@@ -506,7 +516,7 @@ void os_kbd24_init_locked(lv_obj_t *parent)
 
     s_kbd24_py_lbl = lv_label_create(s_kbd24_py_box);
     lv_obj_center(s_kbd24_py_lbl);
-    lv_obj_set_width(s_kbd24_py_lbl, 62);
+    lv_obj_set_size(s_kbd24_py_lbl, 62, 18);
     lv_label_set_text(s_kbd24_py_lbl, "拼音");
     lv_label_set_long_mode(s_kbd24_py_lbl, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(s_kbd24_py_lbl, LV_TEXT_ALIGN_CENTER, 0);
@@ -610,14 +620,15 @@ void os_kbd24_open_locked(lv_obj_t *target_ta, const char *prompt, int start_pag
     s_kbd24_done_cb = done_cb;
     s_kbd24_user_data = user_data;
     s_kbd24_page = (start_page >= 0 && start_page <= 3) ? start_page : 0;
-    s_kbd24_ime_zh = default_zh;
+    s_kbd24_ime_zh = os_i18n_is_en() ? false : default_zh;
     s_kbd24_py_buf[0] = '\0';
 
     if (prompt && prompt[0]) {
         strncpy(s_kbd24_prompt, prompt, sizeof(s_kbd24_prompt) - 1);
         s_kbd24_prompt[sizeof(s_kbd24_prompt) - 1] = '\0';
     } else {
-        strncpy(s_kbd24_prompt, "输入", sizeof(s_kbd24_prompt) - 1);
+        strncpy(s_kbd24_prompt, TR("输入", "Input"), sizeof(s_kbd24_prompt) - 1);
+        s_kbd24_prompt[sizeof(s_kbd24_prompt) - 1] = '\0';
     }
 
     if (target_ta) {

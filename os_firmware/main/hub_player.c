@@ -29,6 +29,7 @@
 
 #include "bsp.h"
 #include "hub_player.h"
+#include "ui/os_i18n.h"
 #include "ui/os_ui.h"
 #include "ui/ui_manager.h"
 #include "hub_protocol.h"
@@ -304,7 +305,7 @@ static void favorites_parse_json(const char *json_str)
                     strncpy(it->title, fn ? fn + 1 : it->sd_path, sizeof(it->title) - 1);
                 }
                 if (!it->artist[0]) {
-                    strncpy(it->artist, "本地音乐", sizeof(it->artist) - 1);
+                    strncpy(it->artist, TR("本地音乐", "Local Music"), sizeof(it->artist) - 1);
                 }
                 s_fav_count++;
             }
@@ -421,7 +422,7 @@ static bool toggle_local_favorite(const char *sd_path, const char *title)
             const char *fn = strrchr(sd_path, '/');
             strncpy(it->title, fn ? fn + 1 : sd_path, sizeof(it->title) - 1);
         }
-        strncpy(it->artist, "本地音乐", sizeof(it->artist) - 1);
+        strncpy(it->artist, TR("本地音乐", "Local Music"), sizeof(it->artist) - 1);
         now_fav = true;
     }
     favorites_save_locked();
@@ -481,10 +482,10 @@ static void refresh_online_ui(const char *custom_status)
         char ssid[33] = {0};
         wifi_portal_get_ssid(ssid, sizeof(ssid));
         char sbuf[80];
-        snprintf(sbuf, sizeof(sbuf), "已联网 (%s) | 点击歌曲直接播放", ssid[0] ? ssid : "Wi-Fi");
+        snprintf(sbuf, sizeof(sbuf), TR("已联网 (%s) | 点击歌曲直接播放", "Online (%s) | Tap track to play"), ssid[0] ? ssid : "Wi-Fi");
         ui_set_online_status(sbuf);
     } else {
-        ui_set_online_status("未联网 | 请在系统设置中连接 Wi-Fi 后在线搜歌");
+        ui_set_online_status(TR("未联网 | 请在系统设置中连接 Wi-Fi 后在线搜歌", "Offline | Connect Wi-Fi in Settings"));
     }
 
     const char *titles[NETEASE_MAX_RESULTS] = {0};
@@ -611,10 +612,10 @@ static void on_ui_quick_search(const char *keyword)
 {
     if (!keyword || !keyword[0]) return;
     if (strcmp(keyword, "热歌榜") == 0) {
-        refresh_online_ui("正在加载网易云热歌榜...");
+        refresh_online_ui(TR("正在加载网易云热歌榜...", "Loading Top Hits..."));
         queue_online_top_list();
     } else {
-        refresh_online_ui("正在在线搜歌...");
+        refresh_online_ui(TR("正在在线搜歌...", "Searching online..."));
         queue_online_search(keyword, "netease", false);
     }
 }
@@ -728,8 +729,8 @@ static void on_ui_volume_changed(int volume_pct)
 /* ========================================================================= */
 
 static bool s_hub_initialized = false;
-static char s_now_title[96] = "G'lam 音乐";
-static char s_now_artist[64] = "点击开启音乐之旅";
+static char s_now_title[96] = "";
+static char s_now_artist[64] = "";
 
 static void set_now_playing_meta(const char *title, const char *artist)
 {
@@ -767,12 +768,14 @@ void hub_player_get_now_playing(char *out_title, size_t title_len,
         char *dot = strrchr(tbuf, '.');
         if (dot) *dot = '\0';
         if (out_title && title_len > 0) snprintf(out_title, title_len, "%s", tbuf);
-        if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s", "本地音频");
+        if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s", TR("本地音频", "Local Audio"));
         return;
     }
 
-    if (out_title && title_len > 0) snprintf(out_title, title_len, "%s", s_now_title);
-    if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s", s_now_artist);
+    if (out_title && title_len > 0) snprintf(out_title, title_len, "%s",
+                                             s_now_title[0] ? s_now_title : TR("G'lam 音乐", "G'lam Music"));
+    if (out_artist && artist_len > 0) snprintf(out_artist, artist_len, "%s",
+                                               s_now_artist[0] ? s_now_artist : TR("点击开启音乐之旅", "Tap to play music"));
 }
 
 void hub_player_trigger_action(int ui_action_id)
@@ -857,7 +860,7 @@ void hub_player_start_or_show(void)
             char ssid[33] = {0}, ip[32] = {0};
             wifi_portal_get_ssid(ssid, sizeof(ssid));
             wifi_portal_get_ip(ip, sizeof(ip));
-            on_wifi_status_changed(true, ssid, ip, "已连接");
+            on_wifi_status_changed(true, ssid, ip, TR("已连接", "Connected"));
         }
     } else {
         ui_set_volume_display(audio_get_volume());
@@ -1178,7 +1181,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
         preload_clear();
         ui_set_album_cover(NULL);
         ui_update_lyrics(NULL);
-        ui_set_track_specs("NetEase / Meting", "正在解析音频...", "准备播放", song.album[0] ? song.album : "在线音乐");
+        ui_set_track_specs("NetEase / Meting", TR("正在解析音频...", "Resolving audio..."), TR("准备播放", "Preparing"), song.album[0] ? song.album : TR("在线音乐", "Online"));
     }
 
     if (!wifi_portal_is_connected()) {
@@ -1187,7 +1190,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
             ui_set_album_cover(NULL);
             ui_update_lyrics(NULL);
         }
-        ui_set_track_specs("Offline", "未连 Wi-Fi", "点左上角配网", "离线状态");
+        ui_set_track_specs("Offline", TR("未连 Wi-Fi", "No Wi-Fi"), TR("点左上角配网", "Connect Wi-Fi"), TR("离线状态", "Offline"));
         return;
     }
 
@@ -1228,7 +1231,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
         bool pre_eof = s_preload.audio_eof;
 
         if (s_preload.audio_buf && pre_len >= 4096) {
-            ui_set_track_specs("MP3 Preloaded", "秒切缓存就绪", pre_eof ? "Full RAM" : "Range Cont.", song.server);
+            ui_set_track_specs("MP3 Preloaded", TR("秒切缓存就绪", "Preload Ready"), pre_eof ? "Full RAM" : "Range Cont.", song.server);
             esp_err_t st_err = audio_stream_start_preloaded(&s_preload.audio_buf, pre_len, pre_expected, pre_eof);
             preload_clear();
             if (st_err == ESP_OK) {
@@ -1244,14 +1247,14 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
             }
         } else {
             preload_clear();
-            ui_set_track_specs("MP3 Stream", "正在边下边播...", "96KB Buffering", song.server);
+            ui_set_track_specs("MP3 Stream", TR("正在边下边播...", "Streaming..."), "96KB Buffering", song.server);
             play_err = netease_api_stream_download(audio_url, &dl_bytes);
         }
     } else {
         char audio_url[512] = {0};
         if (netease_api_resolve_play_url(&song, audio_url, sizeof(audio_url)) != ESP_OK) {
             ESP_LOGW(TAG, "Failed to resolve playable MP3 for %s", song.name);
-            ui_set_track_specs("解析失败", "VIP / 无音源", "请换一首", song.server);
+            ui_set_track_specs(TR("解析失败", "Parse Err"), TR("VIP / 无音源", "VIP / No URL"), TR("请换一首", "Try another"), song.server);
             return;
         }
 
@@ -1274,7 +1277,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
             fetch_and_apply_lrc_for_song(&song);
         }
 
-        ui_set_track_specs("MP3 Stream", "正在边下边播...", "96KB Buffering", song.server);
+        ui_set_track_specs("MP3 Stream", TR("正在边下边播...", "Streaming..."), "96KB Buffering", song.server);
         play_err = netease_api_stream_download(audio_url, &dl_bytes);
     }
 
@@ -1289,7 +1292,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
         }
     } else if (!audio_stream_should_abort()) {
         ESP_LOGE(TAG, "Online streaming failed for %s", song.name);
-        ui_set_track_specs("下载失败", "请重试或下一首", "Network Err", song.server);
+        ui_set_track_specs(TR("下载失败", "DL Failed"), TR("请重试或下一首", "Retry or Next"), "Network Err", song.server);
         ui_update_play_state(false);
     }
 }
@@ -1297,7 +1300,7 @@ static void play_online_song_obj_sync(const netease_song_t *song_in, int list_id
 static void play_online_index_sync(int index)
 {
     if (s_online_count <= 0) {
-        ui_update_meta("在线列表为空", "请先搜歌或加载热歌榜", false);
+        ui_update_meta(TR("在线列表为空", "Online List Empty"), TR("请先搜歌或加载热歌榜", "Search or load Top Hits first"), false);
         ui_set_mode_indicator(2, "ONLINE");
         return;
     }
@@ -1325,7 +1328,7 @@ static void online_worker_task(void *pvParameters)
 
         if (pcmd->type == ONLINE_CMD_SEARCH) {
             if (!wifi_portal_is_connected()) {
-                refresh_online_ui("未连 Wi-Fi，请到系统设置连接网络");
+                refresh_online_ui(TR("未连 Wi-Fi，请到系统设置连接网络", "No Wi-Fi. Connect in Settings"));
                 free(pcmd);
                 continue;
             }
@@ -1357,13 +1360,13 @@ static void online_worker_task(void *pvParameters)
                     play_online_index_sync(0);
                 }
             } else {
-                refresh_online_ui("搜索失败或无结果");
+                refresh_online_ui(TR("搜索失败或无结果", "Search failed or no results"));
             }
             free(tmp);
 
         } else if (pcmd->type == ONLINE_CMD_TOP_LIST) {
             if (!wifi_portal_is_connected()) {
-                refresh_online_ui("未连 Wi-Fi，请到系统设置连接网络");
+                refresh_online_ui(TR("未连 Wi-Fi，请到系统设置连接网络", "No Wi-Fi. Connect in Settings"));
                 free(pcmd);
                 continue;
             }
@@ -1389,7 +1392,7 @@ static void online_worker_task(void *pvParameters)
                     play_online_index_sync(0);
                 }
             } else {
-                refresh_online_ui("加载热歌榜失败");
+                refresh_online_ui(TR("加载热歌榜失败", "Failed to load Top Hits"));
             }
             free(tmp);
 
@@ -1500,7 +1503,7 @@ static void play_sd_track_sync(int index, const char *override_path)
     } else {
         if (s_sd_track_count == 0) {
             ESP_LOGW(TAG, "Cannot play: SD playlist is empty");
-            ui_update_meta("SD卡无本地歌曲", "请插入含MP3的SD卡", false);
+            ui_update_meta(TR("SD卡无本地歌曲", "No Local SD Tracks"), TR("请插入含MP3的SD卡", "Add MP3 files to SD card"), false);
             ui_set_mode_indicator(1, "SD");
             return;
         }
@@ -1534,8 +1537,8 @@ static void play_sd_track_sync(int index, const char *override_path)
     hub_protocol_set_mode(HUB_MODE_STANDALONE);
     lrc_parser_clear();
 
-    set_now_playing_meta(title_buf, "本地音乐 SD");
-    ui_update_meta(title_buf, "本地音乐 SD", false);
+    set_now_playing_meta(title_buf, TR("本地音乐 SD", "Local SD"));
+    ui_update_meta(title_buf, TR("本地音乐 SD", "Local SD"), false);
     ui_set_mode_indicator(1, "SD");
     ui_update_lyrics(NULL);
     ui_set_track_specs("MP3 / WAV", "44.1kHz / 16-bit", "Local I2S", "SD Storage");
@@ -1566,7 +1569,7 @@ static void play_sd_track_sync(int index, const char *override_path)
         ui_update_play_state(true);
     } else {
         ESP_LOGE(TAG, "Failed to play audio file %s (%s)", file_path, esp_err_to_name(err));
-        ui_set_track_specs("播放失败", "请检查音频文件", "SD Error", "SD Storage");
+        ui_set_track_specs(TR("播放失败", "Play Error"), TR("请检查音频文件", "Check audio file"), "SD Error", "SD Storage");
         ui_update_play_state(false);
     }
 }

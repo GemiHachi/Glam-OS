@@ -90,6 +90,11 @@ bool os_installer_is_protected_app(const char *app_id);
  */
 void os_installer_set_uart_fallback(void (*cb)(const char *line));
 
+/**
+ * @brief Write a buffer to both UART0 and USB-Serial/JTAG (when active).
+ */
+void os_installer_serial_send(const char *str, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@
  */
 
 #include "boot_anim.h"
+#include "ui/os_i18n.h"
 
 #include <errno.h>
 #include <math.h>
@@ -133,7 +134,8 @@ static void show_migration_ui(lv_obj_t **out_bar)
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lbl = lv_label_create(scr);
-    lv_label_set_text(lbl, "首次安装：正在迁移启动动画到 TF 卡...");
+    lv_label_set_text(lbl, TR("首次安装：正在迁移启动动画到 TF 卡...",
+                              "First boot: copying boot animation to TF..."));
     lv_obj_set_style_text_color(lbl, lv_color_hex(0xE2E8F0U), 0);
     lv_obj_set_style_text_font(lbl, &ui_font_cjk_14, 0);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, -14);

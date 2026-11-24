@@ -5,6 +5,7 @@
 
 #include "xz_service.h"
 #include "xz_mcp.h"
+#include "os_i18n.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +53,7 @@ static const char *TAG = "xz_service";
 #define XZ_EVT_WS_CONNECTED  BIT0
 #define XZ_EVT_HELLO_OK      BIT1
 #define XZ_EVT_WS_FAILED     BIT2
+#define XZ_EVT_MCP_READY     BIT3
 
 typedef enum {
     XZ_CMD_NONE = 0,
@@ -68,12 +70,18 @@ typedef enum {
     XZ_CMD_END_OVERLAY,
     XZ_CMD_EXEC_MUSIC_HANDOFF,
     XZ_CMD_MIC_TEST,
+    XZ_CMD_VAD_END_SPEECH,
 } xz_cmd_type_t;
 
 typedef struct {
     xz_cmd_type_t type;
     char text[160];
 } xz_cmd_t;
+
+typedef struct {
+    char sid[64];
+    char *raw_json;
+} xz_mcp_job_t;
 
 typedef struct {
     uint8_t *data;
@@ -83,6 +91,7 @@ typedef struct {
 static SemaphoreHandle_t s_lock = NULL;
 static SemaphoreHandle_t s_ws_tx_lock = NULL;
 static QueueHandle_t s_cmd_q = NULL;
+static QueueHandle_t s_mcp_q = NULL;
 static QueueHandle_t s_play_q = NULL;
 static EventGroupHandle_t s_ev = NULL;
 
@@ -93,12 +102,15 @@ static volatile bool s_wifi_ok = false;
 static volatile bool s_ui_active = false;
 static volatile bool s_overlay_active = false;
 static volatile bool s_wakeup_enabled = true;
+static volatile xz_pc_perm_mode_t s_pc_perm_mode = XZ_PC_PERM_PARTIAL;
 static volatile bool s_tts_stop_pending = false;
 static volatile bool s_mic_test_req = false;
 static volatile bool s_mic_test_running = false;
 static volatile bool s_auto_chat_active = false;
 static volatile bool s_opus_reset_req = false;
 static volatile bool s_ws_closing = false;
+static volatile bool s_waiting_server_reply = false;
+static volatile int64_t s_wait_reply_since_us = 0;
 static volatile int64_t s_last_activity_us = 0;
 
 /* Deferred local G'lam Music handoff state */
@@ -116,9 +128,19 @@ static volatile bool s_wn_ready = false;
 
 static char s_client_id[40] = {0};
 static char s_ws_url[192] = {0};
-static char s_ws_token[192] = {0};
+static char s_ws_token[512] = {0};
 static char s_session_id[64] = {0};
 static char s_ws_err_detail[96] = {0};
+static char s_diag_last_rx[180] = {0};
+static char s_diag_last_mcp[96] = {0};
+static int  s_diag_last_mcp_sent = 0;
+static volatile uint32_t s_diag_tx_ok = 0;
+static volatile uint32_t s_diag_tx_drop = 0;
+static volatile uint32_t s_diag_rx_pkts = 0;
+static volatile uint16_t s_diag_idle_peak = 0;
+static volatile bool     s_diag_vad_spoken = false;
+static volatile uint16_t s_diag_vad_sil = 0;
+static volatile uint32_t s_diag_vad_floor = 0;
 
 static esp_websocket_client_handle_t s_ws = NULL;
 static char *s_ws_text_buf = NULL;
@@ -265,11 +287,20 @@ static void load_nvs_config(void)
             s_wakeup_enabled = true;
         }
         s_st.wakeup_enabled = s_wakeup_enabled;
+        uint8_t pm = (uint8_t)XZ_PC_PERM_PARTIAL;
+        if (nvs_get_u8(h, "pc_perm", &pm) == ESP_OK && pm <= (uint8_t)XZ_PC_PERM_ASK_EVERY) {
+            s_pc_perm_mode = (xz_pc_perm_mode_t)pm;
+        } else {
+            s_pc_perm_mode = XZ_PC_PERM_PARTIAL;
+        }
+        s_st.pc_perm_mode = s_pc_perm_mode;
         nvs_close(h);
     } else {
         generate_uuid_v4(s_client_id, sizeof(s_client_id));
         s_wakeup_enabled = true;
         s_st.wakeup_enabled = true;
+        s_pc_perm_mode = XZ_PC_PERM_PARTIAL;
+        s_st.pc_perm_mode = XZ_PC_PERM_PARTIAL;
     }
 }
 
@@ -313,7 +344,7 @@ static esp_err_t ota_http_evt_cb(esp_http_client_event_t *evt)
 static void do_ota_check(void)
 {
     if (!s_wifi_ok) {
-        set_state_detail(XZ_STATE_OFFLINE, "未连 Wi-Fi，请先在系统设置中配网");
+        set_state_detail(XZ_STATE_OFFLINE, TR("未连 Wi-Fi，请先在系统设置中配网", "No Wi-Fi. Connect in Settings"));
         return;
     }
 
@@ -323,7 +354,7 @@ static void do_ota_check(void)
     snprintf(ota_url, sizeof(ota_url), "%s", s_st.ota_url);
     snprintf(mac_str, sizeof(mac_str), "%s", s_st.device_mac);
     s_st.state = XZ_STATE_CHECKING;
-    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "正在连接小智服务器...");
+    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("正在连接小智服务器...", "Connecting to XiaoZhi server..."));
     xz_unlock();
 
     /* Build standard xiaozhi-esp32 OTA POST JSON body */
@@ -369,7 +400,7 @@ static void do_ota_check(void)
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!body) {
-        set_state_detail(XZ_STATE_ERROR, "内存不足");
+        set_state_detail(XZ_STATE_ERROR, TR("内存不足", "Out of memory"));
         return;
     }
 
@@ -379,7 +410,7 @@ static void do_ota_check(void)
     if (!rb.buf) rb.buf = (char *)calloc(1, rb.cap);
     if (!rb.buf) {
         free(body);
-        set_state_detail(XZ_STATE_ERROR, "内存不足");
+        set_state_detail(XZ_STATE_ERROR, TR("内存不足", "Out of memory"));
         return;
     }
 
@@ -400,7 +431,7 @@ static void do_ota_check(void)
     if (!client) {
         free(body);
         free(rb.buf);
-        set_state_detail(XZ_STATE_ERROR, "HTTP 初始化失败");
+        set_state_detail(XZ_STATE_ERROR, TR("HTTP 初始化失败", "HTTP init failed"));
         return;
     }
 
@@ -421,7 +452,7 @@ static void do_ota_check(void)
         ESP_LOGW(TAG, "OTA POST failed: err=%s status=%d url=%s",
                  esp_err_to_name(err), status_code, ota_url);
         char emsg[96];
-        snprintf(emsg, sizeof(emsg), "OTA失败: %s (HTTP %d)", esp_err_to_name(err), status_code);
+        snprintf(emsg, sizeof(emsg), TR("OTA失败: %s (HTTP %d)", "OTA failed: %s (HTTP %d)"), esp_err_to_name(err), status_code);
         free(rb.buf);
         set_state_detail(XZ_STATE_ERROR, emsg);
         return;
@@ -431,7 +462,7 @@ static void do_ota_check(void)
     cJSON *resp = cJSON_Parse(rb.buf);
     free(rb.buf);
     if (!resp) {
-        set_state_detail(XZ_STATE_ERROR, "服务器返回数据异常");
+        set_state_detail(XZ_STATE_ERROR, TR("服务器返回数据异常", "Invalid server response"));
         return;
     }
 
@@ -467,9 +498,11 @@ static void do_ota_check(void)
         if (cJSON_IsString(jmsg) && jmsg->valuestring) {
             snprintf(s_st.activation_msg, sizeof(s_st.activation_msg), "%s", jmsg->valuestring);
         } else {
-            snprintf(s_st.activation_msg, sizeof(s_st.activation_msg), "请登录 xiaozhi.me 绑定设备");
+            snprintf(s_st.activation_msg, sizeof(s_st.activation_msg), "%s",
+                     TR("请登录 xiaozhi.me 绑定设备", "Bind device at xiaozhi.me"));
         }
-        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "等待绑定验证码");
+        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                 TR("等待绑定验证码", "Waiting for bind code"));
         xz_unlock();
         ESP_LOGI(TAG, "Device needs activation: code=%s", s_st.activation_code);
     } else if (s_ws_url[0]) {
@@ -477,11 +510,11 @@ static void do_ota_check(void)
         s_st.activated = true;
         s_st.activation_code[0] = '\0';
         s_st.state = XZ_STATE_IDLE;
-        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "已激活 · 正在建立语音通道...");
+        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("已激活 · 正在建立语音通道...", "Bound · Opening voice link..."));
         xz_unlock();
         ESP_LOGI(TAG, "Device activated! WS=%s", s_ws_url);
     } else {
-        set_state_detail(XZ_STATE_ERROR, "服务端未下发 WebSocket 地址");
+        set_state_detail(XZ_STATE_ERROR, TR("服务端未下发 WebSocket 地址", "No WebSocket URL from server"));
     }
 
     cJSON_Delete(resp);
@@ -491,10 +524,16 @@ static void do_ota_check(void)
 /*                           WebSocket Protocol                              */
 /* ========================================================================= */
 
-static void ws_send_json_str(const char *json)
+static int ws_send_json_str(const char *json)
 {
-    if (!s_ws || !json || !esp_websocket_client_is_connected(s_ws)) return;
-    esp_websocket_client_send_text(s_ws, json, (int)strlen(json), pdMS_TO_TICKS(1500));
+    if (!s_ws || !json || s_ws_closing || !esp_websocket_client_is_connected(s_ws)) return -1;
+    if (s_ws_tx_lock) xSemaphoreTake(s_ws_tx_lock, portMAX_DELAY);
+    int ret = -1;
+    if (s_ws && !s_ws_closing && esp_websocket_client_is_connected(s_ws)) {
+        ret = esp_websocket_client_send_text(s_ws, json, (int)strlen(json), pdMS_TO_TICKS(3500));
+    }
+    if (s_ws_tx_lock) xSemaphoreGive(s_ws_tx_lock);
+    return ret;
 }
 
 static void ws_send_hello(void)
@@ -508,9 +547,45 @@ static void ws_send_hello(void)
     ws_send_json_str(hello);
 }
 
+static void xz_mcp_worker_task(void *arg)
+{
+    (void)arg;
+    xz_mcp_job_t job = {0};
+    while (1) {
+        if (!s_mcp_q || xQueueReceive(s_mcp_q, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (job.raw_json) {
+            cJSON *root = cJSON_Parse(job.raw_json);
+            if (root) {
+                const cJSON *jpay = cJSON_GetObjectItemCaseSensitive(root, "payload");
+                const cJSON *jm = jpay ? cJSON_GetObjectItemCaseSensitive(jpay, "method") : NULL;
+                const char *mname = (cJSON_IsString(jm) && jm->valuestring) ? jm->valuestring : "";
+                char *reply = xz_mcp_handle_payload(job.sid, jpay, &s_hooks);
+                if (reply) {
+                    int rlen = (int)strlen(reply);
+                    int sret = ws_send_json_str(reply);
+                    s_diag_last_mcp_sent = sret;
+                    ESP_LOGI(TAG, "MCP reply (%s, %d B, sent=%d)", mname, rlen, sret);
+                    free(reply);
+                }
+                if (strcmp(mname, "tools/list") == 0) {
+                    xEventGroupSetBits(s_ev, XZ_EVT_MCP_READY);
+                }
+                cJSON_Delete(root);
+            }
+            free(job.raw_json);
+            job.raw_json = NULL;
+        }
+    }
+}
+
 static void handle_ws_json(const char *txt)
 {
     if (!txt || !txt[0]) return;
+    xz_lock();
+    snprintf(s_diag_last_rx, sizeof(s_diag_last_rx), "%.175s", txt);
+    xz_unlock();
     cJSON *root = cJSON_Parse(txt);
     if (!root) {
         ESP_LOGW(TAG, "WS JSON parse failed: %.120s", txt);
@@ -538,12 +613,25 @@ static void handle_ws_json(const char *txt)
         const cJSON *jtxt = cJSON_GetObjectItemCaseSensitive(root, "text");
         if (cJSON_IsString(jtxt) && jtxt->valuestring) {
             s_last_activity_us = esp_timer_get_time();
+            if (jtxt->valuestring[0]) {
+                s_waiting_server_reply = true;
+                s_wait_reply_since_us = esp_timer_get_time();
+            }
             xz_lock();
             snprintf(s_st.stt_text, sizeof(s_st.stt_text), "%s", jtxt->valuestring);
+            if (jtxt->valuestring[0]) {
+                s_st.mic_peak = 0;
+                if (s_st.state == XZ_STATE_LISTENING) {
+                    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                             TR("思考中，请稍候...", "Thinking..."));
+                }
+            }
             xz_unlock();
             ESP_LOGI(TAG, "STT: %s", jtxt->valuestring);
         }
     } else if (strcmp(type, "llm") == 0) {
+        s_last_activity_us = esp_timer_get_time();
+        s_wait_reply_since_us = esp_timer_get_time();
         const cJSON *jemo = cJSON_GetObjectItemCaseSensitive(root, "emotion");
         if (cJSON_IsString(jemo) && jemo->valuestring) {
             xz_lock();
@@ -556,10 +644,11 @@ static void handle_ws_json(const char *txt)
         if (cJSON_IsString(jst) && jst->valuestring) {
             if (strcmp(jst->valuestring, "start") == 0) {
                 s_tts_stop_pending = false;
+                s_waiting_server_reply = false;
                 s_last_activity_us = esp_timer_get_time();
                 xz_lock();
                 s_st.state = XZ_STATE_SPEAKING;
-                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "小智正在回复...");
+                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("小智正在回复...", "XiaoZhi speaking..."));
                 xz_unlock();
             } else if (strcmp(jst->valuestring, "sentence_start") == 0) {
                 if (cJSON_IsString(jtxt) && jtxt->valuestring && jtxt->valuestring[0]) {
@@ -576,24 +665,37 @@ static void handle_ws_json(const char *txt)
         }
     } else if (strcmp(type, "mcp") == 0) {
         const cJSON *jpay = cJSON_GetObjectItemCaseSensitive(root, "payload");
-        char sid_copy[64];
+        const cJSON *jm = jpay ? cJSON_GetObjectItemCaseSensitive(jpay, "method") : NULL;
+        s_last_activity_us = esp_timer_get_time();
+        xz_mcp_job_t job = {0};
         xz_lock();
-        snprintf(sid_copy, sizeof(sid_copy), "%s", s_session_id);
+        snprintf(job.sid, sizeof(job.sid), "%s", s_session_id);
+        if (cJSON_IsString(jm) && jm->valuestring) {
+            snprintf(s_diag_last_mcp, sizeof(s_diag_last_mcp), "%s", jm->valuestring);
+            if (strcmp(jm->valuestring, "tools/call") == 0) {
+                s_wait_reply_since_us = esp_timer_get_time();
+            }
+        }
         xz_unlock();
-        char *reply = xz_mcp_handle_payload(sid_copy, jpay, &s_hooks);
-        if (reply) {
-            ESP_LOGI(TAG, "MCP reply (%u B)", (unsigned)strlen(reply));
-            ws_send_json_str(reply);
-            free(reply);
+        size_t tlen = strlen(txt);
+        job.raw_json = (char *)heap_caps_malloc(tlen + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!job.raw_json) job.raw_json = (char *)malloc(tlen + 1U);
+        if (job.raw_json) {
+            memcpy(job.raw_json, txt, tlen + 1U);
+            if (!s_mcp_q || xQueueSend(s_mcp_q, &job, 0) != pdTRUE) {
+                free(job.raw_json);
+            }
         }
     } else if (strcmp(type, "goodbye") == 0) {
         s_tts_stop_pending = false;
+        s_waiting_server_reply = false;
         s_auto_chat_active = false;
         xz_lock();
         if (s_st.state == XZ_STATE_LISTENING || s_st.state == XZ_STATE_CONNECTING ||
             s_st.state == XZ_STATE_SPEAKING) {
             s_st.state = XZ_STATE_IDLE;
-            snprintf(s_st.status_detail, sizeof(s_st.status_detail), "会话已结束 · 喊「你好小智」唤醒");
+            snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                 TR("会话已结束 · 喊「你好小智」唤醒", "Session ended · Say wake word"));
         }
         xz_unlock();
         if (s_overlay_active && !s_ui_active) {
@@ -615,7 +717,6 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "WebSocket connected");
         xEventGroupSetBits(s_ev, XZ_EVT_WS_CONNECTED);
-        ws_send_hello();
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -623,13 +724,15 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGI(TAG, "WebSocket disconnected/closed (intentional=%d)", s_ws_closing ? 1 : 0);
         if (!s_ws_closing) {
             s_auto_chat_active = false;
+            s_waiting_server_reply = false;
             xz_lock();
             s_st.ws_connected = false;
             s_session_id[0] = '\0';
             if (s_st.state == XZ_STATE_LISTENING || s_st.state == XZ_STATE_CONNECTING ||
                 s_st.state == XZ_STATE_SPEAKING) {
                 s_st.state = s_st.activated ? XZ_STATE_IDLE : XZ_STATE_OFFLINE;
-                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "连接已断开 · 喊「你好小智」唤醒");
+                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                 TR("连接已断开 · 喊「你好小智」唤醒", "Disconnected · Say wake word"));
             }
             xz_unlock();
             xEventGroupSetBits(s_ev, XZ_EVT_WS_FAILED);
@@ -642,7 +745,7 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
     case WEBSOCKET_EVENT_ERROR:
         if (data) {
             snprintf(s_ws_err_detail, sizeof(s_ws_err_detail),
-                     "WS错误: http=%d tls=0x%x err=%d",
+                     TR("WS错误: http=%d tls=0x%x err=%d", "WS Err: http=%d tls=0x%x err=%d"),
                      data->error_handle.esp_ws_handshake_status_code,
                      (unsigned)data->error_handle.esp_tls_last_esp_err,
                      data->error_handle.esp_transport_sock_errno);
@@ -652,7 +755,7 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
                      (unsigned)data->error_handle.esp_tls_stack_err,
                      (unsigned)data->error_handle.esp_tls_cert_verify_flags);
         } else {
-            snprintf(s_ws_err_detail, sizeof(s_ws_err_detail), "WS连接错误");
+            snprintf(s_ws_err_detail, sizeof(s_ws_err_detail), "%s", TR("WS连接错误", "WS connect error"));
             ESP_LOGW(TAG, "WebSocket error");
         }
         xEventGroupSetBits(s_ev, XZ_EVT_WS_FAILED);
@@ -728,18 +831,18 @@ static bool ws_ensure_connected(void)
         return true;
     }
     if (!s_wifi_ok) {
-        set_state_detail(XZ_STATE_OFFLINE, "未连 Wi-Fi");
+        set_state_detail(XZ_STATE_OFFLINE, TR("未连 Wi-Fi", "No Wi-Fi"));
         return false;
     }
+
+    bool did_ota = false;
     if (!s_ws_url[0] || !s_st.activated) {
         do_ota_check();
+        did_ota = true;
         if (!s_st.activated || !s_ws_url[0]) {
             return false;
         }
     }
-
-    ws_close_client();
-    set_state_detail(XZ_STATE_CONNECTING, "正在建立语音通道...");
 
     if (!s_ws_text_buf) {
         s_ws_text_buf = (char *)heap_caps_malloc(XZ_WS_TEXT_BUF_SZ, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -748,76 +851,120 @@ static bool ws_ensure_connected(void)
         s_ws_bin_buf = (uint8_t *)heap_caps_malloc(XZ_WS_BIN_BUF_SZ, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
 
-    char hdrs[384];
-    char mac_copy[24], url_copy[192], tok_copy[192];
-    xz_lock();
-    snprintf(mac_copy, sizeof(mac_copy), "%s", s_st.device_mac);
-    snprintf(url_copy, sizeof(url_copy), "%s", s_ws_url);
-    snprintf(tok_copy, sizeof(tok_copy), "%s", s_ws_token);
-    xz_unlock();
-
-    if (tok_copy[0]) {
-        snprintf(hdrs, sizeof(hdrs),
-                 "Authorization: Bearer %s\r\n"
-                 "Protocol-Version: 1\r\n"
-                 "Device-Id: %s\r\n"
-                 "Client-Id: %s\r\n",
-                 tok_copy, mac_copy, s_client_id);
-    } else {
-        snprintf(hdrs, sizeof(hdrs),
-                 "Protocol-Version: 1\r\n"
-                 "Device-Id: %s\r\n"
-                 "Client-Id: %s\r\n",
-                 mac_copy, s_client_id);
-    }
-
-    esp_websocket_client_config_t cfg = {
-        .uri = url_copy,
-        .headers = hdrs,
-        .buffer_size = 4096,
-        .task_stack = 8192,
-        .task_prio = 5,
-        .disable_auto_reconnect = true,
-        .disable_pingpong_discon = true,
-        .ping_interval_sec = 30,
-        .network_timeout_ms = 5000,
-    };
-    if (strncmp(url_copy, "wss://", 6) == 0) {
-        cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    }
-
-    s_ws_err_detail[0] = '\0';
-    s_ws = esp_websocket_client_init(&cfg);
-    if (!s_ws) {
-        set_state_detail(XZ_STATE_ERROR, "WS初始化失败");
+    char *hdrs = (char *)heap_caps_calloc(1, 896, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!hdrs) hdrs = (char *)calloc(1, 896);
+    char *tok_copy = (char *)heap_caps_calloc(1, 512, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!tok_copy) tok_copy = (char *)calloc(1, 512);
+    if (!hdrs || !tok_copy) {
+        free(hdrs);
+        free(tok_copy);
+        set_state_detail(XZ_STATE_ERROR, TR("内存不足", "Out of memory"));
         return false;
     }
-    esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
-    xEventGroupClearBits(s_ev, XZ_EVT_WS_CONNECTED | XZ_EVT_HELLO_OK | XZ_EVT_WS_FAILED);
 
-    if (esp_websocket_client_start(s_ws) != ESP_OK) {
+    for (int attempt = 0; attempt < 2; attempt++) {
         ws_close_client();
-        char emsg[96];
-        snprintf(emsg, sizeof(emsg), "WS启动失败 (SRAM %uKB)",
-                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U));
-        set_state_detail(XZ_STATE_ERROR, emsg);
-        return false;
+        set_state_detail(XZ_STATE_CONNECTING, TR("正在建立语音通道...", "Opening voice channel..."));
+
+        char mac_copy[24], url_copy[192];
+        xz_lock();
+        snprintf(mac_copy, sizeof(mac_copy), "%s", s_st.device_mac);
+        snprintf(url_copy, sizeof(url_copy), "%s", s_ws_url);
+        snprintf(tok_copy, 512, "%s", s_ws_token);
+        xz_unlock();
+
+        if (tok_copy[0]) {
+            snprintf(hdrs, 896,
+                     "Authorization: Bearer %s\r\n"
+                     "Protocol-Version: 1\r\n"
+                     "Device-Id: %s\r\n"
+                     "Client-Id: %s\r\n",
+                     tok_copy, mac_copy, s_client_id);
+        } else {
+            snprintf(hdrs, 896,
+                     "Protocol-Version: 1\r\n"
+                     "Device-Id: %s\r\n"
+                     "Client-Id: %s\r\n",
+                     mac_copy, s_client_id);
+        }
+
+        esp_websocket_client_config_t cfg = {
+            .uri = url_copy,
+            .headers = hdrs,
+            .buffer_size = 8192,
+            .task_stack = 8192,
+            .task_prio = 5,
+            .disable_auto_reconnect = true,
+            .disable_pingpong_discon = true,
+            .ping_interval_sec = 30,
+            .network_timeout_ms = 5000,
+        };
+        if (strncmp(url_copy, "wss://", 6) == 0) {
+            cfg.crt_bundle_attach = esp_crt_bundle_attach;
+        }
+
+        s_ws_err_detail[0] = '\0';
+        s_ws = esp_websocket_client_init(&cfg);
+        if (!s_ws) {
+            set_state_detail(XZ_STATE_ERROR, TR("WS初始化失败", "WS init failed"));
+            break;
+        }
+        esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
+        xEventGroupClearBits(s_ev, XZ_EVT_WS_CONNECTED | XZ_EVT_HELLO_OK | XZ_EVT_WS_FAILED | XZ_EVT_MCP_READY);
+
+        if (esp_websocket_client_start(s_ws) != ESP_OK) {
+            ws_close_client();
+            char emsg[96];
+            snprintf(emsg, sizeof(emsg), TR("WS启动失败 (SRAM %uKB)", "WS start failed (SRAM %uKB)"),
+                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U));
+            set_state_detail(XZ_STATE_ERROR, emsg);
+            break;
+        }
+
+        EventBits_t cbits = xEventGroupWaitBits(s_ev, XZ_EVT_WS_CONNECTED | XZ_EVT_WS_FAILED,
+                                                pdTRUE, pdFALSE, pdMS_TO_TICKS(8000));
+        if ((cbits & XZ_EVT_WS_CONNECTED) && !(cbits & XZ_EVT_WS_FAILED)) {
+            ws_send_hello();
+            EventBits_t hbits = xEventGroupWaitBits(s_ev, XZ_EVT_HELLO_OK | XZ_EVT_WS_FAILED,
+                                                    pdTRUE, pdFALSE, pdMS_TO_TICKS(6000));
+            if ((hbits & XZ_EVT_HELLO_OK) && !(hbits & XZ_EVT_WS_FAILED)) {
+                /* Wait briefly for server's initial MCP initialize + tools/list handshake to complete
+                 * before starting high-frequency audio streaming */
+                xEventGroupWaitBits(s_ev, XZ_EVT_MCP_READY | XZ_EVT_WS_FAILED,
+                                    pdTRUE, pdFALSE, pdMS_TO_TICKS(1500));
+                free(hdrs);
+                free(tok_copy);
+                return true;
+            }
+            ESP_LOGW(TAG, "WS hello ack failed or timed out (bits=0x%lx, detail=%s)",
+                     (unsigned long)hbits, s_ws_err_detail);
+        } else {
+            ESP_LOGW(TAG, "WS connect failed or timed out (bits=0x%lx, url=%s, detail=%s)",
+                     (unsigned long)cbits, url_copy, s_ws_err_detail);
+        }
+
+        ws_close_client();
+        if (!did_ota) {
+            ESP_LOGI(TAG, "Refreshing OTA credentials and retrying WS...");
+            do_ota_check();
+            did_ota = true;
+            if (!s_st.activated || !s_ws_url[0]) {
+                free(hdrs);
+                free(tok_copy);
+                return false;
+            }
+            continue;
+        }
+        if (s_ws_err_detail[0]) {
+            set_state_detail(XZ_STATE_ERROR, s_ws_err_detail);
+        } else {
+            set_state_detail(XZ_STATE_ERROR, TR("等待小智握手超时，点击重试", "Handshake timeout, tap retry"));
+        }
+        break;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(s_ev, XZ_EVT_HELLO_OK | XZ_EVT_WS_FAILED,
-                                           pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
-    if (bits & XZ_EVT_HELLO_OK) {
-        return true;
-    }
-
-    ESP_LOGW(TAG, "WS handshake failed or timed out (bits=0x%lx, url=%s, detail=%s)",
-             (unsigned long)bits, url_copy, s_ws_err_detail);
-    ws_close_client();
-    if (s_ws_err_detail[0]) {
-        set_state_detail(XZ_STATE_ERROR, s_ws_err_detail);
-    } else {
-        set_state_detail(XZ_STATE_ERROR, "等待小智握手超时，点击重试");
-    }
+    free(hdrs);
+    free(tok_copy);
     return false;
 }
 
@@ -830,13 +977,13 @@ static void run_mic_opus_loopback_test(void)
     s_mic_test_running = true;
     ensure_opus_codecs();
     if (!bsp_audio_has_mic() || !s_opus_enc || !s_opus_dec) {
-        set_state_detail(XZ_STATE_ERROR, "未检测到 ES7210 麦克风或编解码器");
+        set_state_detail(XZ_STATE_ERROR, TR("未检测到 ES7210 麦克风或编解码器", "ES7210 mic or codec not found"));
         s_mic_test_running = false;
         return;
     }
 
     if (bsp_audio_voice_begin(XZ_SAMPLE_RATE) != ESP_OK) {
-        set_state_detail(XZ_STATE_ERROR, "语音通道初始化失败");
+        set_state_detail(XZ_STATE_ERROR, TR("语音通道初始化失败", "Voice channel init failed"));
         s_mic_test_running = false;
         return;
     }
@@ -852,12 +999,12 @@ static void run_mic_opus_loopback_test(void)
         if (lens) free(lens);
         if (pcm) free(pcm);
         bsp_audio_voice_end();
-        set_state_detail(XZ_STATE_ERROR, "测试缓冲分配失败");
+        set_state_detail(XZ_STATE_ERROR, TR("测试缓冲分配失败", "Test buffer alloc failed"));
         s_mic_test_running = false;
         return;
     }
 
-    set_state_detail(XZ_STATE_MIC_TEST, "麦克风录音测试 (3秒) 请对着设备说话...");
+    set_state_detail(XZ_STATE_MIC_TEST, TR("麦克风录音测试 (3秒) 请对着设备说话...", "Mic test (3s): speak to device..."));
     bsp_audio_voice_set_pa(false);
 
     uint16_t max_peak = 0;
@@ -877,7 +1024,7 @@ static void run_mic_opus_loopback_test(void)
         }
     }
 
-    set_state_detail(XZ_STATE_MIC_TEST, "Opus 解码回放测试中...");
+    set_state_detail(XZ_STATE_MIC_TEST, TR("Opus 解码回放测试中...", "Playing back Opus audio..."));
     bsp_audio_voice_set_pa(true);
     for (int i = 0; i < num_frames && s_ui_active; i++) {
         if (lens[i] > 0) {
@@ -896,7 +1043,7 @@ static void run_mic_opus_loopback_test(void)
     bsp_audio_voice_end();
 
     char summary[96];
-    snprintf(summary, sizeof(summary), "麦测完成: 峰值 %u · Opus %uB",
+    snprintf(summary, sizeof(summary), TR("麦测完成: 峰值 %u · Opus %uB", "Mic OK: Peak %u · Opus %uB"),
              (unsigned)max_peak, (unsigned)total_opus);
     xz_lock();
     s_st.mic_peak = 0;
@@ -935,6 +1082,14 @@ static void xz_audio_task(void *arg)
         xz_unlock();
 
         if (st == XZ_STATE_LISTENING && pcm && opus_out) {
+            static int32_t s_dc_x1 = 0, s_dc_y1 = 0;
+            static uint32_t s_vad_noise_floor = 200;
+            static uint16_t s_vad_speech_cnt = 0;
+            static uint16_t s_vad_silence_cnt = 0;
+            static uint8_t s_warmup_frames = 0;
+            static bool s_vad_has_spoken = false;
+            static bool s_vad_stop_sent = false;
+
             if (bsp_audio_is_wake_active()) {
                 bsp_audio_wake_end();
             }
@@ -945,20 +1100,115 @@ static void xz_audio_task(void *arg)
             ensure_opus_codecs();
             if (s_opus_reset_req && s_opus_enc) {
                 s_opus_reset_req = false;
+                s_dc_x1 = 0;
+                s_dc_y1 = 0;
+                s_vad_noise_floor = 200;
+                s_vad_speech_cnt = 0;
+                s_vad_silence_cnt = 0;
+                s_warmup_frames = 5; /* 300ms blanking of ES7210 turn-on pop & stale TTS RX DMA echo */
+                s_vad_has_spoken = false;
+                s_vad_stop_sent = false;
+                s_diag_vad_spoken = false;
+                s_diag_vad_sil = 0;
+                s_diag_vad_floor = s_vad_noise_floor;
                 opus_encoder_ctl(s_opus_enc, OPUS_RESET_STATE);
             }
             if (bsp_audio_has_mic() && bsp_audio_is_voice_active() && s_opus_enc) {
                 static uint32_t s_tx_ok = 0, s_tx_drop = 0;
                 static uint16_t s_tx_max_peak = 0;
                 static int64_t s_tx_log_us = 0;
-                uint16_t peak = 0;
-                if (bsp_audio_voice_read(pcm, XZ_FRAME_SAMPLES, &peak) == ESP_OK) {
+                uint16_t raw_peak = 0;
+                if (bsp_audio_voice_read(pcm, XZ_FRAME_SAMPLES, &raw_peak) == ESP_OK) {
+                    /* 1st-order DC-blocking high-pass filter: y[n] = x[n] - x[n-1] + 0.995*y[n-1] */
+                    uint16_t peak = 0;
+                    uint32_t sum_abs = 0;
+                    for (int k = 0; k < XZ_FRAME_SAMPLES; k++) {
+                        int32_t x = pcm[k];
+                        int32_t y = x - s_dc_x1 + ((s_dc_y1 * 32604) >> 15);
+                        s_dc_x1 = x;
+                        if (y > 32767) y = 32767;
+                        else if (y < -32768) y = -32768;
+                        s_dc_y1 = y;
+                        pcm[k] = (int16_t)y;
+                        uint16_t a = (uint16_t)(y < 0 ? -y : y);
+                        sum_abs += a;
+                        if (a > peak) peak = a;
+                    }
+                    uint32_t avg_abs = sum_abs / (uint32_t)XZ_FRAME_SAMPLES;
+
+                    if (s_waiting_server_reply) {
+                        xz_lock();
+                        s_st.mic_peak = 0;
+                        xz_unlock();
+                        continue;
+                    }
+
+                    if (s_warmup_frames > 0) {
+                        s_warmup_frames--;
+                        if (s_warmup_frames == 0 && avg_abs < 1200) {
+                            uint32_t nf = avg_abs;
+                            if (nf < 100) nf = 100;
+                            if (nf > 650) nf = 650;
+                            s_vad_noise_floor = nf;
+                            s_diag_vad_floor = nf;
+                        }
+                        memset(pcm, 0, XZ_FRAME_SAMPLES * sizeof(int16_t));
+                        peak = 0;
+                    } else {
+                        if (!s_vad_has_spoken && avg_abs < 750 && peak < 2000) {
+                            s_vad_noise_floor = (s_vad_noise_floor * 7U + avg_abs) / 8U;
+                            if (s_vad_noise_floor < 100) s_vad_noise_floor = 100;
+                            if (s_vad_noise_floor > 700) s_vad_noise_floor = 700;
+                        }
+                        s_diag_vad_floor = s_vad_noise_floor;
+
+                        bool is_speech = (avg_abs > s_vad_noise_floor * 2U + 120U) &&
+                                         (peak > s_vad_noise_floor * 3U + 600U);
+                        if (is_speech) {
+                            s_vad_speech_cnt++;
+                            s_vad_silence_cnt = 0;
+                            s_diag_vad_sil = 0;
+                            s_last_activity_us = esp_timer_get_time();
+                            if (!s_vad_has_spoken && s_vad_speech_cnt >= 3) {
+                                s_vad_has_spoken = true;
+                                s_diag_vad_spoken = true;
+                                xz_lock();
+                                if (s_st.state == XZ_STATE_LISTENING) {
+                                    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                                             TR("正在听你说...", "Hearing you..."));
+                                }
+                                xz_unlock();
+                            }
+                        } else if (!s_vad_has_spoken) {
+                            if (s_vad_speech_cnt > 0) {
+                                s_vad_speech_cnt--;
+                            }
+                        } else {
+                            s_vad_silence_cnt++;
+                            s_diag_vad_sil = s_vad_silence_cnt;
+                            /* Leave frames 1..6 (0..360ms) untouched so trailing syllables are never clipped;
+                             * zero frames 7+ (420ms+) so clean digital silence feeds server Silero VAD */
+                            if (s_vad_silence_cnt >= 7) {
+                                memset(pcm, 0, XZ_FRAME_SAMPLES * sizeof(int16_t));
+                                peak = 0;
+                            }
+                            if (s_vad_silence_cnt >= 20 && !s_vad_stop_sent) {
+                                s_vad_stop_sent = true;
+                                s_waiting_server_reply = true;
+                                s_wait_reply_since_us = esp_timer_get_time();
+                                xz_lock();
+                                s_st.mic_peak = 0;
+                                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s",
+                                         TR("思考中，请稍候...", "Thinking..."));
+                                xz_unlock();
+                                post_cmd(XZ_CMD_VAD_END_SPEECH, NULL);
+                            }
+                        }
+                    }
+
                     xz_lock();
                     s_st.mic_peak = peak;
                     xz_unlock();
-                    if (peak > 1200) {
-                        s_last_activity_us = esp_timer_get_time();
-                    }
                     if (peak > s_tx_max_peak) s_tx_max_peak = peak;
                     int enc_len = opus_encode(s_opus_enc, pcm, XZ_FRAME_SAMPLES,
                                               opus_out, XZ_OPUS_MAX_PACKET);
@@ -967,11 +1217,12 @@ static void xz_audio_task(void *arg)
                         if (s_ws && !s_ws_closing && esp_websocket_client_is_connected(s_ws)) {
                             int sent = esp_websocket_client_send_bin(s_ws, (const char *)opus_out,
                                                                      enc_len, pdMS_TO_TICKS(500));
-                            if (sent > 0) s_tx_ok++;
-                            else s_tx_drop++;
+                            if (sent > 0) { s_tx_ok++; s_diag_tx_ok++; }
+                            else { s_tx_drop++; s_diag_tx_drop++; }
                         }
                         if (s_ws_tx_lock) xSemaphoreGive(s_ws_tx_lock);
                     }
+                    s_diag_idle_peak = peak;
                     int64_t now_us = esp_timer_get_time();
                     if (now_us - s_tx_log_us >= 2000000LL) {
                         s_tx_log_us = now_us;
@@ -1021,6 +1272,7 @@ static void xz_audio_task(void *arg)
                     }
                     esp_err_t wret = bsp_audio_voice_write(pcm, (size_t)decoded);
                     s_rx_pkts++;
+                    s_diag_rx_pkts++;
                     int64_t now_us = esp_timer_get_time();
                     if (s_rx_pkts == 1 || now_us - s_rx_log_us >= 1500000LL || wret != ESP_OK) {
                         s_rx_log_us = now_us;
@@ -1058,7 +1310,7 @@ static void xz_audio_task(void *arg)
                 xz_lock();
                 if (s_st.state == XZ_STATE_SPEAKING) {
                     s_st.state = XZ_STATE_IDLE;
-                    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "待命中 · 喊「你好小智」唤醒");
+                    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("待命中 · 喊「你好小智」唤醒", "Ready · Say wake word"));
                 }
                 xz_unlock();
             }
@@ -1162,6 +1414,7 @@ static void end_overlay_session_sync(bool notify_ui)
     bool was_overlay = s_overlay_active;
     s_overlay_active = false;
     s_auto_chat_active = false;
+    s_waiting_server_reply = false;
     flush_play_queue();
     s_tts_stop_pending = false;
     ws_close_client();
@@ -1171,7 +1424,7 @@ static void end_overlay_session_sync(bool notify_ui)
     s_st.mic_peak = 0;
     if (s_st.activated) {
         s_st.state = XZ_STATE_IDLE;
-        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "待命中 · 喊「你好小智」唤醒");
+        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("待命中 · 喊「你好小智」唤醒", "Ready · Say wake word"));
     } else if (!s_wifi_ok) {
         s_st.state = XZ_STATE_OFFLINE;
     }
@@ -1181,20 +1434,20 @@ static void end_overlay_session_sync(bool notify_ui)
     }
 }
 
-static void start_auto_listening(void)
+static void start_auto_listening(bool force_restart)
 {
     if ((!s_ui_active && !s_overlay_active) || !s_auto_chat_active) {
         if (s_st.activated) {
-            set_state_detail(XZ_STATE_IDLE, "已暂停 · 喊「你好小智」唤醒");
+            set_state_detail(XZ_STATE_IDLE, TR("已暂停 · 喊「你好小智」唤醒", "Paused · Say wake word"));
         }
         return;
     }
 
     /* Idempotent guard: avoid duplicate listen/start if already actively listening */
     xz_lock();
-    bool already_listening = (s_st.state == XZ_STATE_LISTENING && s_st.ws_connected);
+    bool already_listening = (s_st.state == XZ_STATE_LISTENING && !s_waiting_server_reply && s_st.ws_connected);
     xz_unlock();
-    if (already_listening && s_ws && esp_websocket_client_is_connected(s_ws) &&
+    if (!force_restart && already_listening && s_ws && esp_websocket_client_is_connected(s_ws) &&
         bsp_audio_is_voice_active()) {
         return;
     }
@@ -1205,14 +1458,15 @@ static void start_auto_listening(void)
     }
 
     if ((!s_ui_active && !s_overlay_active) || !s_auto_chat_active) {
-        set_state_detail(XZ_STATE_IDLE, "已暂停 · 喊「你好小智」唤醒");
+        set_state_detail(XZ_STATE_IDLE, TR("已暂停 · 喊「你好小智」唤醒", "Paused · Say wake word"));
         return;
     }
 
     flush_play_queue();
     s_tts_stop_pending = false;
+    s_waiting_server_reply = false;
     if (bsp_audio_voice_begin(XZ_SAMPLE_RATE) != ESP_OK) {
-        set_state_detail(XZ_STATE_ERROR, "音频初始化失败，点击重试");
+        set_state_detail(XZ_STATE_ERROR, TR("音频初始化失败，点击重试", "Audio init failed, tap retry"));
         s_last_activity_us = esp_timer_get_time();
         return;
     }
@@ -1226,7 +1480,7 @@ static void start_auto_listening(void)
     snprintf(sid, sizeof(sid), "%s", s_session_id);
     s_st.state = XZ_STATE_LISTENING;
     s_st.mic_peak = 0;
-    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "正在聆听，直接说话即可...");
+    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("正在聆听，直接说话即可...", "Listening, speak now..."));
     xz_unlock();
 
     if (sid[0]) {
@@ -1258,8 +1512,19 @@ static void xz_ctrl_task(void *arg)
                     last_act_poll_us = now;
                     do_ota_check();
                     if (s_st.activated && s_ui_active && s_auto_chat_active) {
-                        start_auto_listening();
+                        start_auto_listening(false);
                     }
+                }
+            }
+            /* Recovery: if server did not reply within 5s after end-of-speech (e.g. ASR empty on noise),
+             * reopen auto listening so user can speak immediately */
+            if (s_waiting_server_reply && s_st.state == XZ_STATE_LISTENING &&
+                (now - s_wait_reply_since_us >= 5000000LL)) {
+                if ((s_ui_active || s_overlay_active) && s_auto_chat_active && s_st.ws_connected) {
+                    ESP_LOGI(TAG, "Server reply timeout (5s) -> reopening auto listening");
+                    start_auto_listening(true);
+                } else {
+                    s_waiting_server_reply = false;
                 }
             }
             /* Fallback: execute deferred local music handoff even if LLM skipped TTS */
@@ -1277,7 +1542,7 @@ static void xz_ctrl_task(void *arg)
                     (now - s_last_activity_us >= XZ_OVERLAY_ERR_TIMEOUT_US)) {
                     ESP_LOGI(TAG, "Dynamic Island voice overlay auto-dismiss (state=%d)", (int)cst);
                     end_overlay_session_sync(true);
-                } else if (cst == XZ_STATE_LISTENING &&
+                } else if (cst == XZ_STATE_LISTENING && !s_waiting_server_reply &&
                            (now - s_last_activity_us >= XZ_OVERLAY_IDLE_TIMEOUT_US)) {
                     ESP_LOGI(TAG, "Dynamic Island voice overlay idle timeout -> back to wake listening");
                     end_overlay_session_sync(true);
@@ -1302,34 +1567,38 @@ static void xz_ctrl_task(void *arg)
             last_act_poll_us = esp_timer_get_time();
             do_ota_check();
             if (s_st.activated && (s_ui_active || s_overlay_active) && s_auto_chat_active) {
-                start_auto_listening();
+                start_auto_listening(false);
             }
             break;
 
         case XZ_CMD_WAKEUP_TRIGGERED:
             s_last_activity_us = esp_timer_get_time();
             if (!s_wifi_ok) {
-                set_state_detail(XZ_STATE_OFFLINE, "未连 Wi-Fi，请先配网");
+                set_state_detail(XZ_STATE_OFFLINE, TR("未连 Wi-Fi，请先配网", "No Wi-Fi. Connect first"));
                 break;
             }
-            start_auto_listening();
+            start_auto_listening(false);
             break;
 
         case XZ_CMD_START_LISTEN:
+            start_auto_listening(false);
+            break;
+
         case XZ_CMD_AUTO_RESUME_LISTEN:
-            start_auto_listening();
+            start_auto_listening(true);
             break;
 
         case XZ_CMD_STOP_LISTEN: {
             bool was_listening = false;
             char sid[64];
+            s_waiting_server_reply = false;
             xz_lock();
             was_listening = (s_st.state == XZ_STATE_LISTENING);
             snprintf(sid, sizeof(sid), "%s", s_session_id);
             s_st.mic_peak = 0;
             if (s_st.state == XZ_STATE_LISTENING || s_st.state == XZ_STATE_CONNECTING) {
                 s_st.state = XZ_STATE_IDLE;
-                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "已暂停 · 点击开始对话");
+                snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("已暂停 · 点击开始对话", "Paused · Tap to talk"));
             }
             xz_unlock();
             if (was_listening) {
@@ -1345,9 +1614,31 @@ static void xz_ctrl_task(void *arg)
             break;
         }
 
+        case XZ_CMD_VAD_END_SPEECH: {
+            char sid[64];
+            bool listening = false;
+            xz_lock();
+            listening = (s_st.state == XZ_STATE_LISTENING && s_st.ws_connected);
+            snprintf(sid, sizeof(sid), "%s", s_session_id);
+            xz_unlock();
+            if (listening) {
+                char msg[128];
+                if (sid[0]) {
+                    snprintf(msg, sizeof(msg),
+                             "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"}", sid);
+                } else {
+                    snprintf(msg, sizeof(msg), "{\"type\":\"listen\",\"state\":\"stop\"}");
+                }
+                int sret = ws_send_json_str(msg);
+                ESP_LOGI(TAG, "VAD end-of-speech -> sent listen/stop (ret=%d)", sret);
+            }
+            break;
+        }
+
         case XZ_CMD_ABORT: {
             flush_play_queue();
             s_tts_stop_pending = false;
+            s_waiting_server_reply = false;
             bsp_audio_voice_set_pa(false);
             char sid[64];
             xz_lock();
@@ -1363,9 +1654,9 @@ static void xz_ctrl_task(void *arg)
             ws_send_json_str(msg);
             vTaskDelay(pdMS_TO_TICKS(80));
             if ((s_ui_active || s_overlay_active) && s_auto_chat_active) {
-                start_auto_listening();
+                start_auto_listening(true);
             } else {
-                set_state_detail(XZ_STATE_IDLE, "已打断 · 点击开始对话");
+                set_state_detail(XZ_STATE_IDLE, TR("已打断 · 点击开始对话", "Interrupted · Tap to talk"));
             }
             break;
         }
@@ -1377,13 +1668,27 @@ static void xz_ctrl_task(void *arg)
             s_tts_stop_pending = false;
             bsp_audio_voice_begin(XZ_SAMPLE_RATE);
 
+            bool was_listening = false;
             char sid[64];
             xz_lock();
+            was_listening = (s_st.state == XZ_STATE_LISTENING);
             snprintf(sid, sizeof(sid), "%s", s_session_id);
             snprintf(s_st.stt_text, sizeof(s_st.stt_text), "%s", cmd.text);
             s_st.state = XZ_STATE_IDLE;
-            snprintf(s_st.status_detail, sizeof(s_st.status_detail), "已发送，等待小智回复...");
+            snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("已发送，等待小智回复...", "Sent, waiting for reply..."));
             xz_unlock();
+
+            if (was_listening) {
+                char stop_msg[128];
+                if (sid[0]) {
+                    snprintf(stop_msg, sizeof(stop_msg),
+                             "{\"session_id\":\"%s\",\"type\":\"listen\",\"state\":\"stop\"}", sid);
+                } else {
+                    snprintf(stop_msg, sizeof(stop_msg), "{\"type\":\"listen\",\"state\":\"stop\"}");
+                }
+                ws_send_json_str(stop_msg);
+                vTaskDelay(pdMS_TO_TICKS(40));
+            }
 
             cJSON *obj = cJSON_CreateObject();
             if (sid[0]) cJSON_AddStringToObject(obj, "session_id", sid);
@@ -1393,7 +1698,8 @@ static void xz_ctrl_task(void *arg)
             char *js = cJSON_PrintUnformatted(obj);
             cJSON_Delete(obj);
             if (js) {
-                ws_send_json_str(js);
+                int sret = ws_send_json_str(js);
+                ESP_LOGI(TAG, "SEND_TEXT ('%s') sent=%d", cmd.text, sret);
                 free(js);
             }
             break;
@@ -1473,6 +1779,7 @@ void xz_service_init(const xz_os_hooks_t *hooks)
     s_lock = xSemaphoreCreateMutex();
     s_ws_tx_lock = xSemaphoreCreateMutex();
     s_cmd_q = xQueueCreate(16, sizeof(xz_cmd_t));
+    s_mcp_q = xQueueCreate(6, sizeof(xz_mcp_job_t));
     s_play_q = xQueueCreate(XZ_PLAY_QUEUE_DEPTH, sizeof(xz_opus_pkt_t));
     s_ev = xEventGroupCreate();
 
@@ -1480,11 +1787,14 @@ void xz_service_init(const xz_os_hooks_t *hooks)
     s_st.has_mic = bsp_audio_has_mic();
     s_st.state = XZ_STATE_OFFLINE;
     snprintf(s_st.emotion, sizeof(s_st.emotion), "neutral");
-    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "待命中 · 喊「你好小智」唤醒");
+    snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("待命中 · 喊「你好小智」唤醒", "Ready · Say wake word"));
     load_nvs_config();
 
     /* Control task uses internal RAM stack (safe for NVS/flash/ESP-SR model load/HTTPS TLS) */
     xTaskCreatePinnedToCore(xz_ctrl_task, "xz_ctrl", 8192, NULL, 4, NULL, 0);
+    /* Async MCP worker task so WS event handler never blocks or inverts lock order */
+    xTaskCreatePinnedToCoreWithCaps(xz_mcp_worker_task, "xz_mcp", 8192, NULL, 4, NULL, 0,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     /* Audio/Opus + WakeNet9 task uses PSRAM stack (Opus alloca ~12KB+, never writes flash) */
     xTaskCreatePinnedToCoreWithCaps(xz_audio_task, "xz_audio", 32768, NULL, 5, NULL, 1,
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1506,13 +1816,13 @@ void xz_service_notify_wifi(bool connected, const char *ssid, const char *ip)
 
     if (!connected) {
         s_auto_chat_active = false;
-        set_state_detail(XZ_STATE_OFFLINE, "未连 Wi-Fi，请先在系统设置中配网");
+        set_state_detail(XZ_STATE_OFFLINE, TR("未连 Wi-Fi，请先在系统设置中配网", "No Wi-Fi. Connect in Settings"));
     } else if (s_ui_active || s_overlay_active) {
         s_auto_chat_active = true;
         post_cmd(XZ_CMD_START_LISTEN, NULL);
     } else {
         if (s_st.state == XZ_STATE_OFFLINE) {
-            set_state_detail(XZ_STATE_IDLE, "待命中 · 喊「你好小智」唤醒");
+            set_state_detail(XZ_STATE_IDLE, TR("待命中 · 喊「你好小智」唤醒", "Ready · Say wake word"));
         }
         /* Quietly refresh OTA/activation credentials in background so voice wakeup connects instantly */
         post_cmd(XZ_CMD_SILENT_OTA, NULL);
@@ -1536,7 +1846,7 @@ void xz_service_enter_ui(void)
         /* Immediately enter (or seamlessly continue) hands-free conversation */
         post_cmd(XZ_CMD_START_LISTEN, NULL);
     } else {
-        set_state_detail(XZ_STATE_OFFLINE, "未连 Wi-Fi，请先在系统设置中配网");
+        set_state_detail(XZ_STATE_OFFLINE, TR("未连 Wi-Fi，请先在系统设置中配网", "No Wi-Fi. Connect in Settings"));
     }
 }
 
@@ -1568,6 +1878,39 @@ bool xz_service_is_wakeup_enabled(void)
     return s_wakeup_enabled;
 }
 
+void xz_service_set_pc_perm_mode(xz_pc_perm_mode_t mode)
+{
+    if (mode > XZ_PC_PERM_ASK_EVERY) {
+        mode = XZ_PC_PERM_PARTIAL;
+    }
+    s_pc_perm_mode = mode;
+    xz_lock();
+    s_st.pc_perm_mode = mode;
+    xz_unlock();
+    nvs_handle_t h = 0;
+    if (nvs_open(XZ_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, "pc_perm", (uint8_t)mode);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "PC control permission mode -> %s", xz_service_get_pc_perm_mode_str());
+}
+
+xz_pc_perm_mode_t xz_service_get_pc_perm_mode(void)
+{
+    return s_pc_perm_mode;
+}
+
+const char *xz_service_get_pc_perm_mode_str(void)
+{
+    switch (s_pc_perm_mode) {
+    case XZ_PC_PERM_FULL:      return "full";
+    case XZ_PC_PERM_ASK_EVERY: return "ask_every";
+    case XZ_PC_PERM_PARTIAL:
+    default:                   return "partial";
+    }
+}
+
 void xz_service_trigger_wakeup(void)
 {
     if (!s_initialized) return;
@@ -1579,7 +1922,7 @@ void xz_service_trigger_wakeup(void)
         s_st.overlay_active = true;
         s_st.stt_text[0] = '\0';
         s_st.tts_text[0] = '\0';
-        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "你好！我在听...");
+        snprintf(s_st.status_detail, sizeof(s_st.status_detail), "%s", TR("你好！我在听...", "Hi! Listening..."));
         xz_unlock();
         if (s_hooks.on_wakeup) {
             s_hooks.on_wakeup();
@@ -1649,6 +1992,47 @@ void xz_service_get_status(xz_status_t *out)
     xz_lock();
     *out = s_st;
     xz_unlock();
+}
+
+void xz_service_get_diag_json(char *out, size_t max_len)
+{
+    if (!out || max_len < 64) return;
+    cJSON *obj = cJSON_CreateObject();
+    xz_lock();
+    cJSON_AddNumberToObject(obj, "state", (int)s_st.state);
+    cJSON_AddBoolToObject(obj, "activated", s_st.activated);
+    cJSON_AddBoolToObject(obj, "ws_connected", s_st.ws_connected);
+    cJSON_AddBoolToObject(obj, "ui_active", s_ui_active);
+    cJSON_AddBoolToObject(obj, "overlay_active", s_overlay_active);
+    cJSON_AddBoolToObject(obj, "auto_chat", s_auto_chat_active);
+    cJSON_AddStringToObject(obj, "pc_perm_mode", xz_service_get_pc_perm_mode_str());
+    cJSON_AddBoolToObject(obj, "waiting_reply", s_waiting_server_reply);
+    cJSON_AddBoolToObject(obj, "vad_spoken", s_diag_vad_spoken);
+    cJSON_AddNumberToObject(obj, "vad_sil", s_diag_vad_sil);
+    cJSON_AddNumberToObject(obj, "vad_floor", (double)s_diag_vad_floor);
+    cJSON_AddNumberToObject(obj, "mic_peak", s_st.mic_peak);
+    cJSON_AddNumberToObject(obj, "last_peak", s_diag_idle_peak);
+    cJSON_AddNumberToObject(obj, "tx_ok", (double)s_diag_tx_ok);
+    cJSON_AddNumberToObject(obj, "tx_drop", (double)s_diag_tx_drop);
+    cJSON_AddNumberToObject(obj, "rx_pkts", (double)s_diag_rx_pkts);
+    cJSON_AddStringToObject(obj, "session_id", s_session_id);
+    cJSON_AddStringToObject(obj, "ws_url", s_ws_url);
+    cJSON_AddStringToObject(obj, "ws_err", s_ws_err_detail);
+    cJSON_AddStringToObject(obj, "stt_text", s_st.stt_text);
+    cJSON_AddStringToObject(obj, "tts_text", s_st.tts_text);
+    cJSON_AddStringToObject(obj, "status_detail", s_st.status_detail);
+    cJSON_AddStringToObject(obj, "last_mcp", s_diag_last_mcp);
+    cJSON_AddNumberToObject(obj, "last_mcp_sent", s_diag_last_mcp_sent);
+    cJSON_AddStringToObject(obj, "last_rx", s_diag_last_rx);
+    xz_unlock();
+    char *s = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (s) {
+        snprintf(out, max_len, "%s", s);
+        free(s);
+    } else {
+        snprintf(out, max_len, "{}");
+    }
 }
 
 esp_err_t xz_service_set_ota_url(const char *url)

@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 esp_err_t os_ui_init(void);
+void os_ui_run_first_boot_lang_select(void);
 void os_ui_show_no_tf_shutdown(void);
 esp_err_t os_ui_capture_bmp(uint8_t **out_bmp, size_t *out_len);
 

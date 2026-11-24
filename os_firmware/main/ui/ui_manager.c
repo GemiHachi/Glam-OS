@@ -4,6 +4,7 @@
  */
 
 #include "ui_manager.h"
+#include "os_i18n.h"
 #include "os_kbd24.h"
 #include "ui_theme.h"
 #include "cover_fetcher.h"
@@ -43,6 +44,13 @@ static lv_obj_t *s_pages[3] = {NULL, NULL, NULL};
 static int s_active_tab = 0;
 
 /* Page 0: Online Search */
+static lv_obj_t *s_tab_lbls[3] = {NULL};
+static lv_obj_t *s_lbl_ply_btn = NULL;
+static lv_obj_t *s_lbl_os_btn = NULL;
+static lv_obj_t *s_lbl_search_btn = NULL;
+static lv_obj_t *s_lbl_ref_btn = NULL;
+static lv_obj_t *s_lbl_chip0 = NULL;
+static bool s_cur_is_fav = false;
 static lv_obj_t *s_ta_search = NULL;
 static lv_obj_t *s_lbl_online_status = NULL;
 static lv_obj_t *s_online_list = NULL;
@@ -149,7 +157,7 @@ void ui_init(void)
     /* Start on Home Tabs */
     lv_obj_add_flag(s_player_view, LV_OBJ_FLAG_HIDDEN);
 
-    ui_update_meta("Playpal Hub", "请选择歌曲", false);
+    ui_update_meta("G'lam Music", TR("请选择歌曲", "Select a track"), false);
     ui_update_progress(0, 0);
     ui_update_play_state(false);
     ui_update_lyrics(NULL);
@@ -424,7 +432,7 @@ void ui_update_lyrics(const char *lrc_line)
             lv_obj_set_style_pad_ver(s_lyrics_box, 12, 0);
 
             s_lrc_prev_label = lv_label_create(s_lyrics_box);
-            lv_obj_set_width(s_lrc_prev_label, 169);
+            lv_obj_set_size(s_lrc_prev_label, 169, 18);
             lv_label_set_long_mode(s_lrc_prev_label, LV_LABEL_LONG_DOT);
             lv_obj_set_style_text_color(s_lrc_prev_label, UI_COLOR_TEXT_MUTED, 0);
             lv_obj_set_style_text_font(s_lrc_prev_label, UI_FONT_CJK, 0);
@@ -474,8 +482,9 @@ void ui_update_play_state(bool is_playing)
 void ui_set_current_favorited(bool is_fav)
 {
     UI_LOCK();
+    s_cur_is_fav = is_fav;
     if (s_lbl_fav_cur) {
-        lv_label_set_text(s_lbl_fav_cur, is_fav ? "已藏" : "收藏");
+        lv_label_set_text(s_lbl_fav_cur, is_fav ? TR("已藏", "Saved") : TR("收藏", "Fav"));
         lv_obj_set_style_text_color(s_lbl_fav_cur, is_fav ? UI_COLOR_ACCENT : UI_COLOR_TEXT_MUTED, 0);
     }
     UI_UNLOCK();
@@ -492,7 +501,7 @@ void ui_set_volume_display(int volume_pct)
     }
     if (s_vol_lbl) {
         char vbuf[24];
-        snprintf(vbuf, sizeof(vbuf), "音量 %d%%", volume_pct);
+        snprintf(vbuf, sizeof(vbuf), TR("音量 %d%%", "Vol %d%%"), volume_pct);
         lv_label_set_text(s_vol_lbl, vbuf);
     }
     UI_UNLOCK();
@@ -582,7 +591,7 @@ static void add_song_row(lv_obj_t *list, int idx, const char *text,
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(lbl, 236);
+    lv_obj_set_size(lbl, 236, 18);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(lbl, UI_FONT_CJK, 0);
@@ -623,7 +632,8 @@ void ui_set_online_list(const char **titles, const char **artists, const bool *i
         lv_obj_clean(s_online_list);
         if (count <= 0 || !titles) {
             lv_obj_t *empty = lv_label_create(s_online_list);
-            lv_label_set_text(empty, "点上方输入框输入拼音/歌名，或点快捷热词搜歌");
+            lv_label_set_text(empty, TR("点上方输入框输入拼音/歌名，或点快捷热词搜歌",
+                                        "Tap search above or a quick tag below"));
             lv_obj_set_width(empty, 300);
             lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
@@ -635,7 +645,8 @@ void ui_set_online_list(const char **titles, const char **artists, const bool *i
                          titles[i] ? titles[i] : "",
                          (artists && artists[i]) ? artists[i] : "");
                 bool fav = is_fav ? is_fav[i] : false;
-                add_song_row(s_online_list, i, line, fav ? "已藏" : "收藏", fav,
+                add_song_row(s_online_list, i, line,
+                             fav ? TR("已藏", "Saved") : TR("收藏", "Fav"), fav,
                              row_online_play_cb, row_online_fav_cb, (i == active_idx));
             }
         }
@@ -648,14 +659,15 @@ void ui_set_local_list(const char **titles, const bool *is_fav, int count, int a
     UI_LOCK();
     if (s_lbl_local_hdr) {
         char hbuf[48];
-        snprintf(hbuf, sizeof(hbuf), "SD卡本地音乐 (%d首)", count);
+        snprintf(hbuf, sizeof(hbuf), TR("SD卡本地音乐 (%d首)", "Local SD Music (%d)"), count);
         lv_label_set_text(s_lbl_local_hdr, hbuf);
     }
     if (s_local_list) {
         lv_obj_clean(s_local_list);
         if (count <= 0 || !titles) {
             lv_obj_t *empty = lv_label_create(s_local_list);
-            lv_label_set_text(empty, "SD卡根目录或/music下暂无MP3/WAV歌曲");
+            lv_label_set_text(empty, TR("SD卡根目录或/music下暂无MP3/WAV歌曲",
+                                        "No MP3/WAV tracks in SD root or /music"));
             lv_obj_set_width(empty, 300);
             lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
@@ -665,7 +677,8 @@ void ui_set_local_list(const char **titles, const bool *is_fav, int count, int a
             for (int i = 0; i < count; i++) {
                 snprintf(line, sizeof(line), "%d. %s", i + 1, titles[i] ? titles[i] : "");
                 bool fav = is_fav ? is_fav[i] : false;
-                add_song_row(s_local_list, i, line, fav ? "已藏" : "收藏", fav,
+                add_song_row(s_local_list, i, line,
+                             fav ? TR("已藏", "Saved") : TR("收藏", "Fav"), fav,
                              row_local_play_cb, row_local_fav_cb, (i == active_idx));
             }
         }
@@ -678,14 +691,15 @@ void ui_set_fav_list(const char **titles, const char **artists, const bool *is_o
     UI_LOCK();
     if (s_lbl_fav_hdr) {
         char hbuf[48];
-        snprintf(hbuf, sizeof(hbuf), "我的收藏歌单 (%d首)", count);
+        snprintf(hbuf, sizeof(hbuf), TR("我的收藏歌单 (%d首)", "Favorites (%d)"), count);
         lv_label_set_text(s_lbl_fav_hdr, hbuf);
     }
     if (s_fav_list) {
         lv_obj_clean(s_fav_list);
         if (count <= 0 || !titles) {
             lv_obj_t *empty = lv_label_create(s_fav_list);
-            lv_label_set_text(empty, "还没有收藏音乐，在在线或本地歌单点“收藏”即可添加");
+            lv_label_set_text(empty, TR("还没有收藏音乐，在在线或本地歌单点“收藏”即可添加",
+                                        "No favorites yet. Tap Fav on any track"));
             lv_obj_set_width(empty, 300);
             lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
             lv_obj_set_style_text_color(empty, UI_COLOR_TEXT_MUTED, 0);
@@ -693,13 +707,13 @@ void ui_set_fav_list(const char **titles, const char **artists, const bool *is_o
         } else {
             char line[180];
             for (int i = 0; i < count; i++) {
-                const char *tag = (is_online && is_online[i]) ? "[网]" : "[卡]";
+                const char *tag = (is_online && is_online[i]) ? TR("[网]", "[Web]") : TR("[卡]", "[SD]");
                 if (artists && artists[i] && artists[i][0]) {
                     snprintf(line, sizeof(line), "%s %s - %s", tag, titles[i] ? titles[i] : "", artists[i]);
                 } else {
                     snprintf(line, sizeof(line), "%s %s", tag, titles[i] ? titles[i] : "");
                 }
-                add_song_row(s_fav_list, i, line, "删除", false,
+                add_song_row(s_fav_list, i, line, TR("删除", "Del"), false,
                              row_fav_play_cb, row_fav_del_cb, false);
             }
         }
@@ -773,7 +787,7 @@ static void search_ta_click_cb(lv_event_t *e)
 {
     (void)e;
     if (s_ta_search) {
-        os_kbd24_open_locked(s_ta_search, "搜歌", 0, true, search_kbd_done_cb, NULL);
+        os_kbd24_open_locked(s_ta_search, TR("搜歌", "Search"), 0, true, search_kbd_done_cb, NULL);
     }
 }
 
@@ -817,7 +831,8 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_style_pad_all(topbar, 0, 0);
     lv_obj_clear_flag(topbar, LV_OBJ_FLAG_SCROLLABLE);
 
-    static const char *tab_names[3] = {"在线选歌", "本地音乐", "收藏音乐"};
+    static const char *tab_names_zh[3] = {"在线选歌", "本地音乐", "收藏音乐"};
+    static const char *tab_names_en[3] = {"Online", "Local", "Favs"};
     for (int i = 0; i < 3; i++) {
         s_tab_btns[i] = lv_btn_create(topbar);
         lv_obj_set_pos(s_tab_btns[i], 4 + i * 68, 4);
@@ -830,9 +845,10 @@ static void build_home_view(lv_obj_t *parent)
 
         lv_obj_t *tlbl = lv_label_create(s_tab_btns[i]);
         lv_obj_center(tlbl);
-        lv_label_set_text(tlbl, tab_names[i]);
+        lv_label_set_text(tlbl, os_i18n_is_en() ? tab_names_en[i] : tab_names_zh[i]);
         lv_obj_set_style_text_color(tlbl, UI_COLOR_TEXT_PRI, 0);
         lv_obj_set_style_text_font(tlbl, UI_FONT_CJK, 0);
+        s_tab_lbls[i] = tlbl;
     }
     update_tab_styles(0);
 
@@ -850,9 +866,10 @@ static void build_home_view(lv_obj_t *parent)
 
     lv_obj_t *lbl_ply = lv_label_create(btn_ply);
     lv_obj_center(lbl_ply);
-    lv_label_set_text(lbl_ply, "播放");
+    lv_label_set_text(lbl_ply, TR("播放", "Play"));
     lv_obj_set_style_text_color(lbl_ply, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(lbl_ply, UI_FONT_CJK, 0);
+    s_lbl_ply_btn = lbl_ply;
 
     lv_obj_t *btn_os = lv_btn_create(topbar);
     lv_obj_set_pos(btn_os, 257, 4);
@@ -877,9 +894,10 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_style_text_font(sym_os, &lv_font_montserrat_12, 0);
 
     lv_obj_t *lbl_os = lv_label_create(btn_os);
-    lv_label_set_text(lbl_os, "桌面");
+    lv_label_set_text(lbl_os, TR("桌面", "Home"));
     lv_obj_set_style_text_color(lbl_os, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(lbl_os, UI_FONT_CJK, 0);
+    s_lbl_os_btn = lbl_os;
 
     /* Horizontal Swipeable Pager (y=34..240, 320x206) */
     s_pager = lv_obj_create(s_home_view);
@@ -914,7 +932,7 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_set_pos(s_ta_search, 8, 4);
     lv_obj_set_size(s_ta_search, 244, 28);
     lv_textarea_set_one_line(s_ta_search, true);
-    lv_textarea_set_placeholder_text(s_ta_search, "输入拼音/英文搜歌 (如 qingtian)");
+    lv_textarea_set_placeholder_text(s_ta_search, TR("输入拼音/英文搜歌 (如 qingtian)", "Search songs or artists..."));
     lv_obj_set_style_bg_color(s_ta_search, UI_COLOR_SURFACE, 0);
     lv_obj_set_style_border_color(s_ta_search, UI_COLOR_BORDER, 0);
     lv_obj_set_style_border_width(s_ta_search, 1, 0);
@@ -936,9 +954,10 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_add_event_cb(btn_s, search_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_s = lv_label_create(btn_s);
     lv_obj_center(lbl_s);
-    lv_label_set_text(lbl_s, "搜索");
+    lv_label_set_text(lbl_s, TR("搜索", "Find"));
     lv_obj_set_style_text_color(lbl_s, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(lbl_s, UI_FONT_CJK, 0);
+    s_lbl_search_btn = lbl_s;
 
     static const char *chips[] = {"热歌榜", "周杰伦", "林俊杰", "陈奕迅", "邓紫棋", "薛之谦", "毛不易", "Taylor"};
     lv_obj_t *chip_row = lv_obj_create(p0);
@@ -964,15 +983,16 @@ static void build_home_view(lv_obj_t *parent)
         lv_obj_add_event_cb(cbtn, quick_chip_cb, LV_EVENT_CLICKED, (void *)chips[i]);
         lv_obj_t *clbl = lv_label_create(cbtn);
         lv_obj_center(clbl);
-        lv_label_set_text(clbl, chips[i]);
+        lv_label_set_text(clbl, (i == 0) ? TR("热歌榜", "Top Hits") : chips[i]);
         lv_obj_set_style_text_color(clbl, UI_COLOR_TEXT_PRI, 0);
         lv_obj_set_style_text_font(clbl, UI_FONT_CJK, 0);
+        if (i == 0) s_lbl_chip0 = clbl;
     }
 
     s_lbl_online_status = lv_label_create(p0);
     lv_obj_set_pos(s_lbl_online_status, 8, 64);
-    lv_obj_set_width(s_lbl_online_status, 304);
-    lv_label_set_text(s_lbl_online_status, "点“热歌榜”或搜索在线歌曲");
+    lv_obj_set_size(s_lbl_online_status, 304, 18);
+    lv_label_set_text(s_lbl_online_status, TR("点“热歌榜”或搜索在线歌曲", "Tap Top Hits or search online"));
     lv_label_set_long_mode(s_lbl_online_status, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(s_lbl_online_status, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_set_style_text_font(s_lbl_online_status, UI_FONT_CJK, 0);
@@ -991,7 +1011,7 @@ static void build_home_view(lv_obj_t *parent)
     s_lbl_local_hdr = lv_label_create(p1);
     lv_obj_set_pos(s_lbl_local_hdr, 8, 8);
     lv_obj_set_width(s_lbl_local_hdr, 240);
-    lv_label_set_text(s_lbl_local_hdr, "SD卡本地音乐 (0首)");
+    lv_label_set_text(s_lbl_local_hdr, TR("SD卡本地音乐 (0首)", "Local SD Music (0)"));
     lv_obj_set_style_text_color(s_lbl_local_hdr, UI_COLOR_TEXT_SEC, 0);
     lv_obj_set_style_text_font(s_lbl_local_hdr, UI_FONT_CJK, 0);
 
@@ -1008,9 +1028,10 @@ static void build_home_view(lv_obj_t *parent)
     lv_obj_add_event_cb(btn_ref, action_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lbl_ref = lv_label_create(btn_ref);
     lv_obj_center(lbl_ref);
-    lv_label_set_text(lbl_ref, "刷新");
+    lv_label_set_text(lbl_ref, TR("刷新", "Scan"));
     lv_obj_set_style_text_color(lbl_ref, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(lbl_ref, UI_FONT_CJK, 0);
+    s_lbl_ref_btn = lbl_ref;
 
     s_local_list = lv_obj_create(p1);
     lv_obj_set_pos(s_local_list, 8, 34);
@@ -1026,7 +1047,7 @@ static void build_home_view(lv_obj_t *parent)
     s_lbl_fav_hdr = lv_label_create(p2);
     lv_obj_set_pos(s_lbl_fav_hdr, 8, 8);
     lv_obj_set_width(s_lbl_fav_hdr, 304);
-    lv_label_set_text(s_lbl_fav_hdr, "我的收藏歌单 (0首)");
+    lv_label_set_text(s_lbl_fav_hdr, TR("我的收藏歌单 (0首)", "Favorites (0)"));
     lv_obj_set_style_text_color(s_lbl_fav_hdr, UI_COLOR_TEXT_SEC, 0);
     lv_obj_set_style_text_font(s_lbl_fav_hdr, UI_FONT_CJK, 0);
 
@@ -1130,7 +1151,7 @@ static void build_left_column(lv_obj_t *parent)
 
     s_data_chip_text = lv_label_create(s_data_chip);
     lv_obj_center(s_data_chip_text);
-    lv_label_set_text(s_data_chip_text, "< 选歌");
+    lv_label_set_text(s_data_chip_text, TR("< 选歌", "< List"));
     lv_obj_set_style_text_color(s_data_chip_text, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(s_data_chip_text, UI_FONT_CJK, 0);
 
@@ -1149,7 +1170,7 @@ static void build_left_column(lv_obj_t *parent)
     /* 4. Track Artist (aligned with right progress row y=156) */
     s_track_artist = lv_label_create(s_left_col);
     lv_obj_set_pos(s_track_artist, 10, 156);
-    lv_obj_set_width(s_track_artist, 100);
+    lv_obj_set_size(s_track_artist, 100, 18);
     lv_label_set_text(s_track_artist, "G'lam Music");
     lv_label_set_long_mode(s_track_artist, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(s_track_artist, UI_COLOR_TEXT_MUTED, 0);
@@ -1209,7 +1230,7 @@ static void album_touch_cb(lv_event_t *e)
                 if (s_vol_bar) lv_bar_set_value(s_vol_bar, nv, LV_ANIM_OFF);
                 if (s_vol_lbl) {
                     char vbuf[24];
-                    snprintf(vbuf, sizeof(vbuf), "音量 %d%%", nv);
+                    snprintf(vbuf, sizeof(vbuf), TR("音量 %d%%", "Vol %d%%"), nv);
                     lv_label_set_text(s_vol_lbl, vbuf);
                 }
                 if (s_volume_cb) {
@@ -1279,7 +1300,7 @@ static void build_album_card(lv_obj_t *parent)
 
     s_vol_lbl = lv_label_create(s_vol_overlay);
     lv_obj_align(s_vol_lbl, LV_ALIGN_TOP_MID, 0, 5);
-    lv_label_set_text(s_vol_lbl, "音量 70%");
+    lv_label_set_text(s_vol_lbl, TR("音量 70%", "Vol 70%"));
     lv_obj_set_style_text_color(s_vol_lbl, UI_COLOR_TEXT_PRI, 0);
     lv_obj_set_style_text_font(s_vol_lbl, UI_FONT_CJK, 0);
 
@@ -1410,7 +1431,7 @@ static void build_metadata_section(lv_obj_t *parent)
 
         *vals[r] = lv_label_create(s_meta_box);
         lv_obj_set_pos(*vals[r], 72, y);
-        lv_obj_set_width(*vals[r], 93);
+        lv_obj_set_size(*vals[r], 93, 18);
         lv_label_set_text(*vals[r], defs[r]);
         lv_label_set_long_mode(*vals[r], LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_align(*vals[r], LV_TEXT_ALIGN_RIGHT, 0);
@@ -1508,9 +1529,34 @@ static void build_controls_section(lv_obj_t *parent)
     lv_obj_add_event_cb(s_btn_fav_cur, action_btn_cb, LV_EVENT_CLICKED, NULL);
     s_lbl_fav_cur = lv_label_create(s_btn_fav_cur);
     lv_obj_center(s_lbl_fav_cur);
-    lv_label_set_text(s_lbl_fav_cur, "收藏");
+    lv_label_set_text(s_lbl_fav_cur, TR("收藏", "Fav"));
     lv_obj_set_style_text_color(s_lbl_fav_cur, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_set_style_text_font(s_lbl_fav_cur, UI_FONT_CJK, 0);
+}
+
+void ui_manager_refresh_language(void)
+{
+    static const char *tab_names_zh[3] = {"在线选歌", "本地音乐", "收藏音乐"};
+    static const char *tab_names_en[3] = {"Online", "Local", "Favs"};
+    bool en = os_i18n_is_en();
+    for (int i = 0; i < 3; i++) {
+        if (s_tab_lbls[i]) {
+            lv_label_set_text(s_tab_lbls[i], en ? tab_names_en[i] : tab_names_zh[i]);
+        }
+    }
+    if (s_lbl_ply_btn) lv_label_set_text(s_lbl_ply_btn, TR("播放", "Play"));
+    if (s_lbl_os_btn) lv_label_set_text(s_lbl_os_btn, TR("桌面", "Home"));
+    if (s_ta_search) lv_textarea_set_placeholder_text(s_ta_search, TR("输入拼音/英文搜歌 (如 qingtian)", "Search songs or artists..."));
+    if (s_lbl_search_btn) lv_label_set_text(s_lbl_search_btn, TR("搜索", "Find"));
+    if (s_lbl_chip0) lv_label_set_text(s_lbl_chip0, TR("热歌榜", "Top Hits"));
+    if (s_lbl_ref_btn) lv_label_set_text(s_lbl_ref_btn, TR("刷新", "Scan"));
+    if (s_data_chip_text) lv_label_set_text(s_data_chip_text, TR("< 选歌", "< List"));
+    if (s_lbl_fav_cur) lv_label_set_text(s_lbl_fav_cur, s_cur_is_fav ? TR("已藏", "Saved") : TR("收藏", "Fav"));
+    if (s_vol_lbl) {
+        char vbuf[24];
+        snprintf(vbuf, sizeof(vbuf), TR("音量 %d%%", "Vol %d%%"), s_current_vol);
+        lv_label_set_text(s_vol_lbl, vbuf);
+    }
 }
 
 static void action_btn_cb(lv_event_t *e)

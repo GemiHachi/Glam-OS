@@ -4,7 +4,9 @@
  */
 
 #include "os_spk_installer.h"
+#include "ui/os_i18n.h"
 #include "ui/os_ui.h"
+#include "xz/xz_mcp.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -23,6 +25,7 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/base64.h"
 
@@ -33,7 +36,7 @@ static const char *TAG = "os_inst";
 #define SPK_VERSION             (1U)
 #define SPK_MAX_PKG_BYTES       (2 * 1024 * 1024)
 #define UART_INST_PORT          (UART_NUM_0)
-#define UART_LINE_BUF_SZ        (2048)
+#define UART_LINE_BUF_SZ        (8192)
 
 typedef struct {
     char     magic[4];
@@ -337,7 +340,7 @@ int os_installer_scan_sd_install_dir(void)
 
     if (installed > 0 && s_updated_cb) {
         char msg[64];
-        snprintf(msg, sizeof(msg), "TF卡已导入 %d 个新应用", installed);
+        snprintf(msg, sizeof(msg), TR("TF卡已导入 %d 个新应用", "Imported %d app(s) from TF"), installed);
         s_updated_cb(msg);
     }
     return installed;
@@ -461,7 +464,7 @@ int os_installer_list_apps(os_app_info_t *out_apps, int max_apps)
         os_app_info_t *xz = &out_apps[count++];
         memset(xz, 0, sizeof(*xz));
         snprintf(xz->id, sizeof(xz->id), "%s", OS_SYSTEM_APP_XIAOZHI_ID);
-        snprintf(xz->name, sizeof(xz->name), "小智 AI");
+        snprintf(xz->name, sizeof(xz->name), "%s", TR("小智 AI", "XiaoZhi AI"));
         snprintf(xz->version, sizeof(xz->version), "1.0.0");
         xz->accent_hex = 0x14B8A6U;
         xz->elf_size = 0;
@@ -556,7 +559,7 @@ esp_err_t os_installer_uninstall_app(const char *app_id, bool delete_data)
         }
     }
     if (s_updated_cb) {
-        s_updated_cb("已卸载应用");
+        s_updated_cb(TR("已卸载应用", "App uninstalled"));
     }
     return ESP_OK;
 }
@@ -585,10 +588,30 @@ static const char s_web_html[] =
     "let r=await fetch('/api/install',{method:'POST',body:f});"
     "document.getElementById('st').textContent=await r.text();load();}load();</script></body></html>";
 
+static const char s_web_html_en[] =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>G'lam OS App Installer</title>"
+    "<style>body{font-family:sans-serif;background:#0b1020;color:#e2e8f0;padding:24px;max-width:560px;margin:auto}"
+    ".card{background:#151c32;border:1px solid #26314e;border-radius:12px;padding:18px;margin-bottom:16px}"
+    "button{background:#0ea5e9;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:15px;cursor:pointer}"
+    "input{margin:12px 0;display:block}pre{background:#090d18;padding:10px;border-radius:8px;overflow:auto}</style>"
+    "</head><body><h2>G'lam OS Wireless App Installer</h2>"
+    "<div class='card'><p>Select a packaged <b>.gla</b> app to install safely to TF card <code>/sdcard/apps/</code> (never overwrites Flash OS; legacy .spk supported).</p>"
+    "<input type='file' id='f' accept='.gla,.spk'>"
+    "<button onclick='up()'>Upload & Install to TF</button>"
+    "<p id='st'></p></div>"
+    "<div class='card'><b>Installed TF Card Apps:</b><pre id='apps'>Loading...</pre></div>"
+    "<script>async function load(){let r=await fetch('/api/apps');document.getElementById('apps').textContent=await r.text();}"
+    "async function up(){let f=document.getElementById('f').files[0];if(!f){alert('Please select a .gla or .spk file');return;}"
+    "document.getElementById('st').textContent='Uploading...';"
+    "let r=await fetch('/api/install',{method:'POST',body:f});"
+    "document.getElementById('st').textContent=await r.text();load();}load();</script></body></html>";
+
 static esp_err_t http_root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, s_web_html, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, os_i18n_is_en() ? s_web_html_en : s_web_html, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t http_apps_get(httpd_req_t *req)
@@ -661,7 +684,7 @@ static esp_err_t http_install_post(httpd_req_t *req)
 
     if (s_updated_cb) {
         char toast[96];
-        snprintf(toast, sizeof(toast), "Wi-Fi 已安装: %s", app_id);
+        snprintf(toast, sizeof(toast), TR("Wi-Fi 已安装: %s", "Wi-Fi installed: %s"), app_id);
         s_updated_cb(toast);
     }
 
@@ -771,12 +794,91 @@ static esp_err_t http_audio_beep_post(httpd_req_t *req)
     return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t http_pc_mcp_poll_get(httpd_req_t *req)
+{
+    char *json_str = xz_mcp_poll_pending_http_json();
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t res = httpd_resp_send(req, json_str ? json_str : "{\"type\":\"none\"}", HTTPD_RESP_USE_STRLEN);
+    if (json_str) free(json_str);
+    return res;
+}
+
+static esp_err_t http_pc_mcp_reply_post(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > 16384) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid PC MCP reply size");
+        return ESP_FAIL;
+    }
+    char *buf = (char *)heap_caps_malloc((size_t)req->content_len + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = (char *)malloc((size_t)req->content_len + 1U);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t received = 0;
+    while (received < (size_t)req->content_len) {
+        int r = httpd_req_recv(req, buf + received, (size_t)req->content_len - received);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive interrupted");
+            return ESP_FAIL;
+        }
+        received += (size_t)r;
+    }
+    buf[received] = '\0';
+
+    bool ok = xz_mcp_submit_http_resp_json(buf);
+    free(buf);
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    return httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t http_xz_diag_get(httpd_req_t *req)
+{
+    char qbuf[128] = {0};
+    char act[32] = {0};
+    char txt[64] = {0};
+    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
+        if (httpd_query_key_value(qbuf, "action", act, sizeof(act)) == ESP_OK) {
+            if (strcmp(act, "wakeup") == 0) {
+                xz_service_trigger_wakeup();
+            } else if (strcmp(act, "text") == 0) {
+                if (httpd_query_key_value(qbuf, "q", txt, sizeof(txt)) == ESP_OK && txt[0]) {
+                    xz_service_send_text(txt);
+                } else {
+                    xz_service_send_text("你好");
+                }
+            } else if (strcmp(act, "dismiss") == 0) {
+                xz_service_dismiss_overlay();
+            }
+        }
+    }
+    char *buf = (char *)heap_caps_calloc(1, 1536, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    xz_service_get_diag_json(buf, 1536);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t res = httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return res;
+}
+
 static void start_http_installer_server(void)
 {
     if (s_httpd) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 6144;
-    cfg.max_uri_handlers = 10;
+    cfg.max_uri_handlers = 14;
+    cfg.lru_purge_enable = true;
+    cfg.recv_wait_timeout = 5;
+    cfg.send_wait_timeout = 5;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to start HTTP installer server");
         return;
@@ -789,6 +891,9 @@ static void start_http_installer_server(void)
     static const httpd_uri_t uri_shot = { .uri = "/api/screenshot", .method = HTTP_GET, .handler = http_screenshot_get };
     static const httpd_uri_t uri_adiag = { .uri = "/api/audio_diag", .method = HTTP_GET, .handler = http_audio_diag_get };
     static const httpd_uri_t uri_abeep = { .uri = "/api/audio_beep", .method = HTTP_POST, .handler = http_audio_beep_post };
+    static const httpd_uri_t uri_pc_poll = { .uri = "/api/pc_mcp/poll", .method = HTTP_GET, .handler = http_pc_mcp_poll_get };
+    static const httpd_uri_t uri_pc_reply = { .uri = "/api/pc_mcp/reply", .method = HTTP_POST, .handler = http_pc_mcp_reply_post };
+    static const httpd_uri_t uri_xz_diag = { .uri = "/api/xz_diag", .method = HTTP_GET, .handler = http_xz_diag_get };
     httpd_register_uri_handler(s_httpd, &uri_root);
     httpd_register_uri_handler(s_httpd, &uri_info);
     httpd_register_uri_handler(s_httpd, &uri_apps);
@@ -797,6 +902,9 @@ static void start_http_installer_server(void)
     httpd_register_uri_handler(s_httpd, &uri_shot);
     httpd_register_uri_handler(s_httpd, &uri_adiag);
     httpd_register_uri_handler(s_httpd, &uri_abeep);
+    httpd_register_uri_handler(s_httpd, &uri_pc_poll);
+    httpd_register_uri_handler(s_httpd, &uri_pc_reply);
+    httpd_register_uri_handler(s_httpd, &uri_xz_diag);
     ESP_LOGI(TAG, "Channel 2A HTTP Installer listening on port %d", cfg.server_port);
 }
 
@@ -816,6 +924,25 @@ typedef struct {
 
 static uart_spk_rx_t s_uart_rx = {0};
 static bool s_reply_on_usb = false;
+static SemaphoreHandle_t s_serial_tx_lock = NULL;
+
+void os_installer_serial_send(const char *str, size_t len)
+{
+    if (!str || len == 0) return;
+    if (s_serial_tx_lock) xSemaphoreTake(s_serial_tx_lock, pdMS_TO_TICKS(200));
+    if (uart_is_driver_installed(UART_INST_PORT)) {
+        uart_write_bytes(UART_INST_PORT, str, len);
+    }
+    if (usb_serial_jtag_is_driver_installed()) {
+        size_t off = 0;
+        while (off < len) {
+            int wrote = usb_serial_jtag_write_bytes(str + off, len - off, pdMS_TO_TICKS(50));
+            if (wrote <= 0) break;
+            off += (size_t)wrote;
+        }
+    }
+    if (s_serial_tx_lock) xSemaphoreGive(s_serial_tx_lock);
+}
 
 static void uart_reply(const char *msg)
 {
@@ -942,10 +1069,12 @@ static void handle_uart_json_line(const char *line)
             uart_reply_proto(legacy, "INSTALL_OK\n");
             if (s_updated_cb) {
                 char toast[96];
-                snprintf(toast, sizeof(toast), "USB 已安装: %.63s", app_id);
+                snprintf(toast, sizeof(toast), TR("USB 已安装: %.63s", "USB installed: %.63s"), app_id);
                 s_updated_cb(toast);
             }
         }
+    } else if (xz_mcp_on_serial_line(line, s_reply_on_usb)) {
+        /* Handled by XiaoZhi PC MCP dual-channel bridge */
     } else if (s_uart_fallback_cb) {
         s_uart_fallback_cb(line);
     }
@@ -1009,6 +1138,9 @@ static void uart_installer_task(void *pvParameters)
 
 static void start_uart_installer(void)
 {
+    if (!s_serial_tx_lock) {
+        s_serial_tx_lock = xSemaphoreCreateMutex();
+    }
     uart_config_t cfg = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -1020,13 +1152,13 @@ static void start_uart_installer(void)
     if (!uart_is_driver_installed(UART_INST_PORT)) {
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(10));
-        if (uart_driver_install(UART_INST_PORT, 4096, 1024, 0, NULL, 0) == ESP_OK) {
+        if (uart_driver_install(UART_INST_PORT, 4096, 2048, 0, NULL, 0) == ESP_OK) {
             uart_param_config(UART_INST_PORT, &cfg);
         }
     }
     if (!usb_serial_jtag_is_driver_installed()) {
         usb_serial_jtag_driver_config_t usj_cfg = {
-            .tx_buffer_size = 1024,
+            .tx_buffer_size = 2048,
             .rx_buffer_size = 4096,
         };
         usb_serial_jtag_driver_install(&usj_cfg);

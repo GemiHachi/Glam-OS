@@ -387,7 +387,7 @@ static esp_err_t try_resolve_with_br(const char *base_url, int br, char *out_url
 static void build_song_search_keyword(const netease_song_t *song, char *kw, size_t max_len)
 {
     if (!song || !kw || max_len == 0) return;
-    if (song->artist[0] && strcmp(song->artist, "Unknown") != 0 && strcmp(song->artist, "本地音乐 SD") != 0) {
+    if (song->artist[0] && strcmp(song->artist, "Unknown") != 0 && strcmp(song->artist, "本地音乐 SD") != 0 && strcmp(song->artist, "Local SD") != 0) {
         snprintf(kw, max_len, "%s %s", song->name, song->artist);
     } else {
         snprintf(kw, max_len, "%s", song->name);

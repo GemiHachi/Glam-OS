@@ -20,6 +20,7 @@
 #include "esp_timer.h"
 #include "esp_tls_crypto.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_heap_caps.h"
 #include <errno.h>
 #include <arpa/inet.h>
@@ -920,7 +921,7 @@ esp_websocket_client_handle_t esp_websocket_client_init(const esp_websocket_clie
     ESP_WS_CLIENT_MEM_CHECK(TAG, client->rx_buffer, {
         goto _websocket_init_fail;
     });
-    client->tx_buffer = malloc(buffer_size);
+    client->tx_buffer = malloc(buffer_size + 16);
     ESP_WS_CLIENT_MEM_CHECK(TAG, client->tx_buffer, {
         goto _websocket_init_fail;
     });
@@ -1267,14 +1268,6 @@ static void esp_websocket_client_task(void *pv)
 #endif
             ESP_LOGD(TAG, "Transport connected to %s://%s:%d", client->config->scheme, client->config->host, client->config->port);
 
-            {
-                int sock = esp_transport_get_socket(client->transport);
-                if (sock >= 0) {
-                    int nodelay = 1;
-                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                }
-            }
-
             client->state = WEBSOCKET_STATE_CONNECTED;
             client->wait_for_pong_resp = false;
             client->error_handle.error_type = WEBSOCKET_ERROR_TYPE_NONE;
@@ -1398,7 +1391,7 @@ static void esp_websocket_client_task(void *pv)
         }
         xSemaphoreGiveRecursive(client->lock);
         if (WEBSOCKET_STATE_CONNECTED == client->state) {
-            read_select = esp_transport_poll_read(client->transport, 1000); //Poll every 1000ms
+            read_select = esp_transport_poll_read(client->transport, 50); //Poll every 50ms so TX never starves on client->lock
             if (read_select < 0) {
                 xSemaphoreTakeRecursive(client->lock, lock_timeout);
                 esp_tls_error_handle_t error_handle = esp_transport_get_error_handle(client->transport);

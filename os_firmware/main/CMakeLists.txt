@@ -10,6 +10,7 @@ idf_component_register(
         "netease_api.c"
         "lrc_parser.c"
         "ui/os_ui.c"
+        "ui/os_i18n.c"
         "ui/os_kbd24.c"
         "ui/os_xz_view.c"
         "ui/ui_manager.c"

@@ -4,6 +4,7 @@
  */
 
 #include "wifi_portal.h"
+#include "ui/os_i18n.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,11 +106,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             } else {
                 esp_wifi_connect();
             }
-            notify_status("正在重试连接...");
+            notify_status(TR("正在重试连接...", "Retrying Wi-Fi..."));
         } else if (!s_scanning && s_saved_ssid[0] != '\0') {
-            notify_status("连接失败，请核对密码或重新扫描");
+            notify_status(TR("连接失败，请核对密码或重新扫描", "Connect failed. Check password or rescan"));
         } else {
-            notify_status("未连接");
+            notify_status(TR("未连接", "Disconnected"));
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -119,7 +120,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_sta_connected = true;
         s_retry_count = 0;
         ESP_LOGI(TAG, "Wi-Fi connected! SSID=%s IP=%s", s_saved_ssid, s_sta_ip);
-        notify_status("已连接");
+        notify_status(TR("已连接", "Connected"));
     }
 }
 
@@ -191,7 +192,7 @@ esp_err_t wifi_portal_connect(const char *ssid, const char *password)
     esp_wifi_disconnect();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     ESP_LOGI(TAG, "Connecting to Wi-Fi SSID: %s", s_saved_ssid);
-    notify_status("正在连接...");
+    notify_status(TR("正在连接...", "Connecting..."));
     return esp_wifi_connect();
 }
 

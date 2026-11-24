@@ -6,6 +6,7 @@
  */
 
 #include "os_xz_view.h"
+#include "os_i18n.h"
 #include "os_kbd24.h"
 #include "xz_service.h"
 
@@ -44,6 +45,8 @@ static lv_obj_t *s_cfg_modal = NULL;
 static lv_obj_t *s_cfg_ta_url = NULL;
 static lv_obj_t *s_cfg_wake_lbl = NULL;
 static lv_obj_t *s_cfg_wake_btn = NULL;
+static lv_obj_t *s_cfg_perm_lbl = NULL;
+static lv_obj_t *s_cfg_perm_btn = NULL;
 
 /* Static scratch buffers (exclusively accessed from LVGL thread -> zero stack pressure) */
 static xz_status_t s_ui_st = {0};
@@ -65,6 +68,37 @@ static void close_cfg_modal(void)
     s_cfg_ta_url = NULL;
     s_cfg_wake_lbl = NULL;
     s_cfg_wake_btn = NULL;
+    s_cfg_perm_lbl = NULL;
+    s_cfg_perm_btn = NULL;
+}
+
+static void refresh_cfg_perm_btn(void)
+{
+    if (!s_cfg_perm_btn || !s_cfg_perm_lbl) return;
+    xz_pc_perm_mode_t pm = xz_service_get_pc_perm_mode();
+    uint32_t bg = 0x14B8A6U;
+    const char *txt = TR("电脑: 部分访问", "PC: Partial");
+    if (pm == XZ_PC_PERM_FULL) {
+        bg = 0xD97706U;
+        txt = TR("电脑: 完全权限", "PC: Full");
+    } else if (pm == XZ_PC_PERM_ASK_EVERY) {
+        bg = 0x3B82F6U;
+        txt = TR("电脑: 每次都问", "PC: Ask All");
+    }
+    lv_obj_set_style_bg_color(s_cfg_perm_btn, lv_color_hex(bg), 0);
+    lv_label_set_text(s_cfg_perm_lbl, txt);
+    lv_obj_set_style_text_color(s_cfg_perm_lbl, lv_color_hex(0xFFFFFFU), 0);
+}
+
+static void on_cfg_perm_cycle_click(lv_event_t *e)
+{
+    (void)e;
+    xz_pc_perm_mode_t cur = xz_service_get_pc_perm_mode();
+    xz_pc_perm_mode_t next = (cur == XZ_PC_PERM_FULL) ? XZ_PC_PERM_PARTIAL :
+                             (cur == XZ_PC_PERM_PARTIAL) ? XZ_PC_PERM_ASK_EVERY :
+                                                           XZ_PC_PERM_FULL;
+    xz_service_set_pc_perm_mode(next);
+    refresh_cfg_perm_btn();
 }
 
 static void refresh_cfg_wake_btn(void)
@@ -72,7 +106,8 @@ static void refresh_cfg_wake_btn(void)
     if (!s_cfg_wake_btn || !s_cfg_wake_lbl) return;
     bool en = xz_service_is_wakeup_enabled();
     lv_obj_set_style_bg_color(s_cfg_wake_btn, lv_color_hex(en ? 0x14B8A6U : s_th.card_top), 0);
-    lv_label_set_text(s_cfg_wake_lbl, en ? "语音唤醒: 开" : "语音唤醒: 关");
+    lv_label_set_text(s_cfg_wake_lbl, en ? TR("语音唤醒: 开", "Wake Word: ON")
+                                         : TR("语音唤醒: 关", "Wake Word: OFF"));
     lv_obj_set_style_text_color(s_cfg_wake_lbl, lv_color_hex(en ? 0xFFFFFFU : s_th.text_sec), 0);
 }
 
@@ -94,7 +129,7 @@ static void on_cfg_url_ta_click(lv_event_t *e)
 {
     (void)e;
     if (s_cfg_ta_url) {
-        os_kbd24_open_locked(s_cfg_ta_url, "服务地址", 0, false, NULL, NULL);
+        os_kbd24_open_locked(s_cfg_ta_url, TR("服务地址", "Server URL"), 0, false, NULL, NULL);
     }
 }
 
@@ -143,7 +178,7 @@ static void open_cfg_modal(void)
 
     lv_obj_t *title = lv_label_create(s_cfg_modal);
     lv_obj_set_pos(title, 10, 8);
-    lv_label_set_text(title, "小智 AI 设置与自检");
+    lv_label_set_text(title, TR("小智 AI 设置与自检", "XiaoZhi AI Settings"));
     lv_obj_set_style_text_color(title, lv_color_hex(s_th.text_pri), 0);
     lv_obj_set_style_text_font(title, &ui_font_cjk_14, 0);
 
@@ -158,31 +193,27 @@ static void open_cfg_modal(void)
     lv_obj_set_style_pad_all(btn_back, 0, 0);
     lv_obj_add_event_cb(btn_back, on_cfg_close_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lb = lv_label_create(btn_back);
-    lv_label_set_text(lb, "返回");
+    lv_label_set_text(lb, TR("返回", "Back"));
     lv_obj_set_style_text_color(lb, lv_color_hex(s_th.text_sec), 0);
     lv_obj_set_style_text_font(lb, &ui_font_cjk_14, 0);
     lv_obj_center(lb);
 
     lv_obj_t *info = lv_label_create(s_cfg_modal);
-    lv_obj_set_pos(info, 10, 36);
+    lv_obj_set_pos(info, 10, 34);
     lv_obj_set_width(info, 300);
-    snprintf(s_ui_buf, sizeof(s_ui_buf), "MAC: %s | 权限: 系统最高\n麦: %s | 唤醒模型: %s",
+    snprintf(s_ui_buf, sizeof(s_ui_buf),
+             TR("MAC: %s | 麦: %s | 唤醒: %s",
+                "MAC: %s | Mic: %s | Wake: %s"),
              s_ui_st.device_mac,
-             s_ui_st.has_mic ? "ES7210" : "无",
-             s_ui_st.wakeup_ready ? "你好小智 就绪" : "加载中");
+             s_ui_st.has_mic ? "ES7210" : TR("无", "None"),
+             s_ui_st.wakeup_ready ? TR("就绪", "Ready") : TR("加载", "Load"));
     lv_label_set_text(info, s_ui_buf);
     lv_obj_set_style_text_color(info, lv_color_hex(s_th.text_sec), 0);
     lv_obj_set_style_text_font(info, &ui_font_cjk_14, 0);
 
-    lv_obj_t *url_tip = lv_label_create(s_cfg_modal);
-    lv_obj_set_pos(url_tip, 10, 76);
-    lv_label_set_text(url_tip, "OTA 服务器地址:");
-    lv_obj_set_style_text_color(url_tip, lv_color_hex(s_th.text_mut), 0);
-    lv_obj_set_style_text_font(url_tip, &ui_font_cjk_14, 0);
-
     s_cfg_wake_btn = lv_btn_create(s_cfg_modal);
-    lv_obj_set_pos(s_cfg_wake_btn, 198, 72);
-    lv_obj_set_size(s_cfg_wake_btn, 112, 24);
+    lv_obj_set_pos(s_cfg_wake_btn, 10, 58);
+    lv_obj_set_size(s_cfg_wake_btn, 146, 28);
     lv_obj_set_style_border_color(s_cfg_wake_btn, lv_color_hex(s_th.card_border), 0);
     lv_obj_set_style_border_width(s_cfg_wake_btn, 1, 0);
     lv_obj_set_style_radius(s_cfg_wake_btn, 7, 0);
@@ -194,16 +225,36 @@ static void open_cfg_modal(void)
     lv_obj_center(s_cfg_wake_lbl);
     refresh_cfg_wake_btn();
 
+    s_cfg_perm_btn = lv_btn_create(s_cfg_modal);
+    lv_obj_set_pos(s_cfg_perm_btn, 164, 58);
+    lv_obj_set_size(s_cfg_perm_btn, 146, 28);
+    lv_obj_set_style_border_color(s_cfg_perm_btn, lv_color_hex(s_th.card_border), 0);
+    lv_obj_set_style_border_width(s_cfg_perm_btn, 1, 0);
+    lv_obj_set_style_radius(s_cfg_perm_btn, 7, 0);
+    lv_obj_set_style_shadow_width(s_cfg_perm_btn, 0, 0);
+    lv_obj_set_style_pad_all(s_cfg_perm_btn, 0, 0);
+    lv_obj_add_event_cb(s_cfg_perm_btn, on_cfg_perm_cycle_click, LV_EVENT_CLICKED, NULL);
+    s_cfg_perm_lbl = lv_label_create(s_cfg_perm_btn);
+    lv_obj_set_style_text_font(s_cfg_perm_lbl, &ui_font_cjk_14, 0);
+    lv_obj_center(s_cfg_perm_lbl);
+    refresh_cfg_perm_btn();
+
+    lv_obj_t *url_tip = lv_label_create(s_cfg_modal);
+    lv_obj_set_pos(url_tip, 10, 92);
+    lv_label_set_text(url_tip, TR("OTA 服务器地址:", "OTA Server URL:"));
+    lv_obj_set_style_text_color(url_tip, lv_color_hex(s_th.text_mut), 0);
+    lv_obj_set_style_text_font(url_tip, &ui_font_cjk_14, 0);
+
     s_cfg_ta_url = lv_textarea_create(s_cfg_modal);
-    lv_obj_set_pos(s_cfg_ta_url, 10, 102);
-    lv_obj_set_size(s_cfg_ta_url, 300, 36);
+    lv_obj_set_pos(s_cfg_ta_url, 10, 112);
+    lv_obj_set_size(s_cfg_ta_url, 300, 34);
     lv_textarea_set_one_line(s_cfg_ta_url, true);
     lv_textarea_set_text(s_cfg_ta_url, s_ui_st.ota_url);
     lv_obj_set_style_bg_color(s_cfg_ta_url, lv_color_hex(s_th.recess_bg), 0);
     lv_obj_set_style_border_color(s_cfg_ta_url, lv_color_hex(s_th.recess_border), 0);
     lv_obj_set_style_border_width(s_cfg_ta_url, 1, 0);
     lv_obj_set_style_radius(s_cfg_ta_url, 8, 0);
-    lv_obj_set_style_pad_ver(s_cfg_ta_url, 7, 0);
+    lv_obj_set_style_pad_ver(s_cfg_ta_url, 6, 0);
     lv_obj_set_style_pad_hor(s_cfg_ta_url, 8, 0);
     lv_obj_set_style_text_color(s_cfg_ta_url, lv_color_hex(s_th.text_pri), 0);
     lv_obj_set_style_text_font(s_cfg_ta_url, &ui_font_cjk_14, 0);
@@ -215,14 +266,14 @@ static void open_cfg_modal(void)
         uint32_t fg;
         lv_event_cb_t cb;
     } acts[3] = {
-        { "保存地址", s_th.accent,   0xFFFFFFU,    on_cfg_save_click },
-        { "恢复官方", s_th.card_top, s_th.text_pri, on_cfg_reset_click },
-        { "麦测3秒",  s_th.card_top, s_th.muted_ok, on_cfg_mictest_click },
+        { TR("保存地址", "Save URL"), s_th.accent,   0xFFFFFFU,    on_cfg_save_click },
+        { TR("恢复官方", "Reset"),    s_th.card_top, s_th.text_pri, on_cfg_reset_click },
+        { TR("麦测3秒", "Mic Test"),  s_th.card_top, s_th.muted_ok, on_cfg_mictest_click },
     };
     for (int i = 0; i < 3; i++) {
         lv_obj_t *b = lv_btn_create(s_cfg_modal);
         lv_obj_set_pos(b, 10 + i * 102, 152);
-        lv_obj_set_size(b, 96, 36);
+        lv_obj_set_size(b, 96, 34);
         lv_obj_set_style_bg_color(b, lv_color_hex(acts[i].bg), 0);
         lv_obj_set_style_border_color(b, lv_color_hex(s_th.card_border), 0);
         lv_obj_set_style_border_width(b, i == 0 ? 0 : 1, 0);
@@ -238,10 +289,11 @@ static void open_cfg_modal(void)
     }
 
     lv_obj_t *note = lv_label_create(s_cfg_modal);
-    lv_obj_set_pos(note, 10, 196);
+    lv_obj_set_pos(note, 10, 192);
     lv_obj_set_width(note, 300);
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(note, "提示: 「麦测3秒」会本地录制3秒并经Opus编解码回放，用于验证麦克风与喇叭。");
+    lv_label_set_text(note, TR("点击上方「电脑权限」可切换: 完全权限 / 部分访问 / 每次都问。「麦测3秒」用于验证麦与喇叭。",
+                               "Tap PC Priv above: Full / Partial / Ask All. Mic Test verifies mic & speaker."));
     lv_obj_set_style_text_color(note, lv_color_hex(s_th.text_mut), 0);
     lv_obj_set_style_text_font(note, &ui_font_cjk_14, 0);
 
@@ -259,7 +311,7 @@ static void on_text_kbd_done(const char *text, void *user_data)
 static void on_kbd_btn_click(lv_event_t *e)
 {
     (void)e;
-    os_kbd24_open_locked(NULL, "问小智", 0, true, on_text_kbd_done, NULL);
+    os_kbd24_open_locked(NULL, TR("问小智", "Ask AI"), 0, true, on_text_kbd_done, NULL);
 }
 
 static void on_cfg_btn_click(lv_event_t *e)
@@ -425,7 +477,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_clear_flag(s_badge_box, LV_OBJ_FLAG_SCROLLABLE);
 
     s_badge_lbl = lv_label_create(s_badge_box);
-    lv_label_set_text(s_badge_lbl, "小智 · 初始化");
+    lv_label_set_text(s_badge_lbl, TR("小智 · 初始化", "AI · Init"));
     lv_obj_set_style_text_color(s_badge_lbl, lv_color_hex(s_th.accent), 0);
     lv_obj_set_style_text_font(s_badge_lbl, &ui_font_cjk_14, 0);
     lv_obj_center(s_badge_lbl);
@@ -441,7 +493,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_set_style_pad_all(btn_kbd, 0, 0);
     lv_obj_add_event_cb(btn_kbd, on_kbd_btn_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lk = lv_label_create(btn_kbd);
-    lv_label_set_text(lk, "打字");
+    lv_label_set_text(lk, TR("打字", "Type"));
     lv_obj_set_style_text_color(lk, lv_color_hex(s_th.text_pri), 0);
     lv_obj_set_style_text_font(lk, &ui_font_cjk_14, 0);
     lv_obj_center(lk);
@@ -457,7 +509,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_set_style_pad_all(btn_cfg, 0, 0);
     lv_obj_add_event_cb(btn_cfg, on_cfg_btn_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lc = lv_label_create(btn_cfg);
-    lv_label_set_text(lc, "设置");
+    lv_label_set_text(lc, TR("设置", "Cfg"));
     lv_obj_set_style_text_color(lc, lv_color_hex(s_th.text_sec), 0);
     lv_obj_set_style_text_font(lc, &ui_font_cjk_14, 0);
     lv_obj_center(lc);
@@ -475,7 +527,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
 
     lv_obj_t *at = lv_label_create(s_act_card);
     lv_obj_align(at, LV_ALIGN_TOP_MID, 0, 0);
-    lv_label_set_text(at, "请在控制台输入 6 位绑定验证码");
+    lv_label_set_text(at, TR("请在控制台输入 6 位绑定验证码", "Enter 6-digit code in console"));
     lv_obj_set_style_text_color(at, lv_color_hex(s_th.text_sec), 0);
     lv_obj_set_style_text_font(at, &ui_font_cjk_14, 0);
 
@@ -486,7 +538,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_set_style_text_font(s_act_code_lbl, &lv_font_montserrat_32, 0);
 
     s_act_msg_lbl = lv_label_create(s_act_card);
-    lv_obj_set_width(s_act_msg_lbl, 200);
+    lv_obj_set_size(s_act_msg_lbl, 200, 18);
     lv_obj_align(s_act_msg_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_label_set_long_mode(s_act_msg_lbl, LV_LABEL_LONG_DOT);
     lv_label_set_text(s_act_msg_lbl, "xiaozhi.me");
@@ -504,7 +556,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_set_style_pad_all(btn_ref, 0, 0);
     lv_obj_add_event_cb(btn_ref, on_refresh_btn_click, LV_EVENT_CLICKED, NULL);
     lv_obj_t *lrf = lv_label_create(btn_ref);
-    lv_label_set_text(lrf, "刷新状态");
+    lv_label_set_text(lrf, TR("刷新状态", "Refresh"));
     lv_obj_set_style_text_color(lrf, lv_color_hex(s_th.accent), 0);
     lv_obj_set_style_text_font(lrf, &ui_font_cjk_14, 0);
     lv_obj_center(lrf);
@@ -566,7 +618,8 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_set_width(s_sub_lbl, 292);
     lv_label_set_long_mode(s_sub_lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(s_sub_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(s_sub_lbl, "你好，我是小智，正在自动连接语音对话...");
+    lv_label_set_text(s_sub_lbl, TR("你好，我是小智，正在自动连接语音对话...",
+                                    "Hi! I'm XiaoZhi, connecting to voice..."));
     lv_obj_set_style_text_color(s_sub_lbl, lv_color_hex(s_th.text_pri), 0);
     lv_obj_set_style_text_font(s_sub_lbl, &ui_font_cjk_14, 0);
 
@@ -581,7 +634,7 @@ void os_xz_view_build(lv_obj_t *body, lv_obj_t *scr, const os_xz_theme_t *th)
     lv_obj_add_event_cb(s_btn_ptt, on_ptt_event, LV_EVENT_CLICKED, NULL);
 
     s_lbl_ptt = lv_label_create(s_btn_ptt);
-    lv_label_set_text(s_lbl_ptt, "点击开始对话");
+    lv_label_set_text(s_lbl_ptt, TR("点击开始对话", "Tap to Talk"));
     lv_obj_set_style_text_color(s_lbl_ptt, lv_color_hex(0xFFFFFFU), 0);
     lv_obj_set_style_text_font(s_lbl_ptt, &ui_font_cjk_14, 0);
     lv_obj_center(s_lbl_ptt);
@@ -617,48 +670,49 @@ void os_xz_view_refresh(void)
             else lv_obj_clear_flag(s_stage, LV_OBJ_FLAG_HIDDEN);
         }
 
-        const char *badge = "小智 · 待命";
+        const char *badge = TR("小智 · 待命", "AI · Ready");
         uint32_t badge_col = s_th.muted_ok;
-        const char *ptt_txt = "点击开始对话";
+        const char *ptt_txt = TR("点击开始对话", "Tap to Talk");
         uint32_t ptt_bg = s_th.accent;
 
         switch (s_ui_st.state) {
         case XZ_STATE_OFFLINE:
-            badge = "小智 · 未联网"; badge_col = s_th.text_mut;
-            ptt_txt = "未连 Wi-Fi · 点击重试"; ptt_bg = s_th.card_top;
+            badge = TR("小智 · 未联网", "AI · Offline"); badge_col = s_th.text_mut;
+            ptt_txt = TR("未连 Wi-Fi · 点击重试", "No Wi-Fi · Tap Retry"); ptt_bg = s_th.card_top;
             break;
         case XZ_STATE_CHECKING:
-            badge = "小智 · 连接中"; badge_col = s_th.accent;
-            ptt_txt = "正在连接小智服务器..."; ptt_bg = s_th.card_top;
+            badge = TR("小智 · 连接中", "AI · Sync"); badge_col = s_th.accent;
+            ptt_txt = TR("正在连接小智服务器...", "Connecting to server..."); ptt_bg = s_th.card_top;
             break;
         case XZ_STATE_UNACTIVATED:
-            badge = "小智 · 待绑定"; badge_col = 0xF59E0BU;
-            ptt_txt = "绑定完成后点击刷新"; ptt_bg = s_th.accent;
+            badge = TR("小智 · 待绑定", "AI · Bind"); badge_col = 0xF59E0BU;
+            ptt_txt = TR("绑定完成后点击刷新", "Tap Refresh after binding"); ptt_bg = s_th.accent;
             break;
         case XZ_STATE_IDLE:
-            badge = "小智 · 待命"; badge_col = s_th.muted_ok;
-            ptt_txt = s_ui_st.has_mic ? "点击开始对话" : "点击开始对话 (可点右上角打字)";
+            badge = TR("小智 · 待命", "AI · Ready"); badge_col = s_th.muted_ok;
+            ptt_txt = s_ui_st.has_mic ? TR("点击开始对话", "Tap to Talk")
+                                      : TR("点击开始对话 (可点右上角打字)", "Tap to Talk (or Type)");
             ptt_bg = s_th.accent;
             break;
         case XZ_STATE_CONNECTING:
-            badge = "小智 · 握手中"; badge_col = s_th.accent;
-            ptt_txt = "正在建立语音通道 · 点击重连"; ptt_bg = s_th.card_top;
+            badge = TR("小智 · 握手中", "AI · Link"); badge_col = s_th.accent;
+            ptt_txt = TR("正在建立语音通道 · 点击重连", "Opening voice link · Retry"); ptt_bg = s_th.card_top;
             break;
         case XZ_STATE_LISTENING:
-            badge = "小智 · 聆听中"; badge_col = 0x22C55EU;
-            ptt_txt = "正在聆听 · 直接说话 (点击暂停)"; ptt_bg = 0x16A34AU;
+            badge = TR("小智 · 聆听中", "AI · Listen"); badge_col = 0x22C55EU;
+            ptt_txt = TR("正在聆听 · 直接说话 (点击暂停)", "Listening · Speak (Tap Pause)"); ptt_bg = 0x16A34AU;
             break;
         case XZ_STATE_SPEAKING:
-            badge = "小智 · 说话中"; badge_col = 0x38BDF8U;
-            ptt_txt = "点击打断并继续说话"; ptt_bg = 0xF59E0BU;
+            badge = TR("小智 · 说话中", "AI · Speak"); badge_col = 0x38BDF8U;
+            ptt_txt = TR("点击打断并继续说话", "Tap to Interrupt"); ptt_bg = 0xF59E0BU;
             break;
         case XZ_STATE_MIC_TEST:
-            badge = "小智 · 麦测中"; badge_col = 0x22C55EU;
-            ptt_txt = "麦克风与 Opus 自检中..."; ptt_bg = s_th.card_top;
+            badge = TR("小智 · 麦测中", "AI · MicTest"); badge_col = 0x22C55EU;
+            ptt_txt = TR("麦克风与 Opus 自检中...", "Testing mic & Opus..."); ptt_bg = s_th.card_top;
             break;
         case XZ_STATE_ERROR:
-            badge = "小智 · 异常"; badge_col = 0xEF4444U;
-            ptt_txt = "连接异常 · 点击重试"; ptt_bg = s_th.accent;
+            badge = TR("小智 · 异常", "AI · Error"); badge_col = 0xEF4444U;
+            ptt_txt = TR("连接异常 · 点击重试", "Error · Tap to Retry"); ptt_bg = s_th.accent;
             break;
         }
 
@@ -694,11 +748,11 @@ void os_xz_view_refresh(void)
         snprintf(s_ui_buf, sizeof(s_ui_buf), "%s", s_ui_st.status_detail);
     } else if (s_ui_st.state == XZ_STATE_LISTENING) {
         snprintf(s_ui_buf, sizeof(s_ui_buf), "%s",
-                 s_ui_st.stt_text[0] ? s_ui_st.stt_text : "正在聆听你的声音...");
+                 s_ui_st.stt_text[0] ? s_ui_st.stt_text : TR("正在聆听你的声音...", "Listening to you..."));
     } else if (s_ui_st.tts_text[0]) {
         snprintf(s_ui_buf, sizeof(s_ui_buf), "%s", s_ui_st.tts_text);
     } else if (s_ui_st.stt_text[0]) {
-        snprintf(s_ui_buf, sizeof(s_ui_buf), "我: %s", s_ui_st.stt_text);
+        snprintf(s_ui_buf, sizeof(s_ui_buf), TR("我: %s", "Me: %s"), s_ui_st.stt_text);
     } else {
         snprintf(s_ui_buf, sizeof(s_ui_buf), "%s", s_ui_st.status_detail);
     }
