@@ -1,7 +1,39 @@
 # G'lam OS 更新日志 (Changelog)
 
-> 本文档记录当前版本相对于 GitHub 上一版本（`3dc8054` — *Document adaptive multi-board BSP and reorder README*）的全部核心更新内容。  
-> 本次迭代的核心里程碑是**将「小智 AI（XiaoZhi AI）」深度原生集成至 G'lam OS 内核级架构**，并同步完成全双工音频驱动重构、灵动岛全局交互融合、开机动画引擎以及系统稳定性与内存治理升级。
+> 本文档记录 **G'lam OS** 各主要版本的迭代更新内容（从 GitHub 上一版本 `e4dc7e9` / `v2.0.0` 延续至当前最新工程版本）。  
+> 最新版本核心围绕 **Windows PC 双通道 MCP 双向桥接（17 项工具）、SolidWorks 联动、中英双语系统（i18n）** 以及 **小智语音状态机 / 本地 VAD / WebSocket 稳定性治理** 展开。
+
+---
+
+## v2.1.0（2026-11-25）— PC 双向控制桥接（17 项 MCP 工具）、SolidWorks 联动、中英双语系统与语音稳定性升级
+
+### 一、Windows PC 双通道 MCP 控制桥接（扩展至 17 项工具）
+- **USB 串口 + Wi-Fi HTTP 双通道桥接（`xz_mcp.c` / `xz_mcp.h` / `os_spk_installer.c`）**：
+  - 新增 USB 串口实时信令（`pc_hello` / `pc_hb` / `pc_mcp_req` / `pc_mcp_resp` / `xz_diag`）与 Wi-Fi HTTP 轮询回调通道（`GET /api/pc_mcp/poll`、`POST /api/pc_mcp/reply`），无需固定连接方式即可自动保持 PC 在线绑定。
+  - 将小智设备端 MCP 能力由 13 项扩展至 **17 项工具**，新增 4 项桌面协同工具：
+    - `pc.control`：直接执行应用启停、窗口聚焦、网页打开、键鼠按键、音量/媒体与 Shell 等快捷操作；
+    - `pc.ai_agent`：调用 PC 端视觉 Computer Use 子代理执行点击视频/按钮/链接与多步 GUI 自动化；
+    - `pc.ext_mcp`：通过 `list` / `call` 发现并调用 PC 端挂载的外部 Stdio MCP 服务器工具；
+    - `pc.solidworks`：直连 Windows SolidWorks 2025 COM 接口执行参数化建模与 `ai_model` 自由建模（支持 `get_status`、`new_part`、`create_box`、`create_cylinder`、`create_tube`、`view`、`rebuild`、`save`、`export`、`ai_model`）。
+  - 支持 `tools/list` 按 `withUserTools` 请求按需下发系统特权工具，精简核心工具 Schema 描述以适配云端模型调用。
+- **PC 操作三级安全权限模型（`xz_service.h` / `os_ui.c` / `os_xz_view.c`）**：
+  - 新增 `XZ_PC_PERM_FULL`（全自动放行）、`XZ_PC_PERM_PARTIAL`（敏感操作拦截确认）、`XZ_PC_PERM_ASK_EVERY`（每次弹窗/口头确认）三级模式，可在设备端设置实时切换。
+- **Schema 与超时对齐优化**：
+  - 将 `pc.solidworks` 的管件内径参数由 `id` 更名为 `inner_dia`，避免与 JSON Schema `$id` 关键字冲突，并将数值维度参数保持 `"number"` 类型以支持小数毫米输入。
+  - 优化 `forward_pc_tool_call` 工具转发等待超时为 `14s`，对齐云端会话超时窗口，防止长任务拖死 WebSocket 语音通道。
+
+### 二、语音交互状态机、本地 VAD 与 WebSocket 稳定性治理
+- **消除「说话后随机不回复」状态机死锁（`xz_service.c`）**：
+  - 移除 `s_waiting_server_reply` 等待回复期间检测到噪声仅清除等待标志却未重置 `s_vad_stop_sent` / 未重发 `listen/start` 的竞态缺陷；增加 `s_mcp_tool_running` 标记，防止 MCP 工具执行期间误触发 5 秒无回复恢复超时，并在断线、`goodbye` 及退出语音浮层时同步清零复位。
+- **本地 VAD 鲁棒性调优**：
+  - 优化连续语音触发与尾音归零策略（需连续 3 帧有效能量触发、保留 6 帧尾音、~1.2s 静音窗口收尾 `listen/stop`），降低敲击键盘/瞬间杂音误触发与句间短停顿截断。
+- **WebSocket 传输层抗抖动加固（`esp_websocket_client.c` / `sdkconfig` / `sdkconfig.defaults`）**：
+  - 将 `CONFIG_WS_BUFFER_SIZE` 扩容至 `4096` 并开启 `CONFIG_WS_DYNAMIC_BUFFER` 与 `CONFIG_ESP_WS_CLIENT_ENABLE_DYNAMIC_BUFFER`；关闭易与 mbedTLS 并发读写抢占冲突的 `CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK`，消除高频 Opus 发帧时的 `transport_poll_write(0)` 写超时丢帧问题。
+  - 在 `esp_websocket_client.c` 中优化发送瞬时超时的保活处理（丢弃超时单帧并保持 WSS 长连接不断开）。
+
+### 三、中英双语系统（i18n）、UI 交互与音频链路打磨
+- **轻量级中英双语系统（`os_i18n.c` / `os_i18n.h`）**：新增 `OS_LANG_ZH` / `OS_LANG_EN` 双语运行与 NVS 持久化，支持首次刷机开机语言选择及全界面实时切换。
+- **UI 与全双工音频体验提升（`os_ui.c` / `os_kbd24.c` / `os_xz_view.c` / `ui_manager.c` / `bsp_audio.c` / `hub_player.c`）**：持续打磨桌面视图、虚拟键盘、小智表情视图与音乐切歌体验。
 
 ---
 

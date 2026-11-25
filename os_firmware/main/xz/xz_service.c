@@ -110,6 +110,7 @@ static volatile bool s_auto_chat_active = false;
 static volatile bool s_opus_reset_req = false;
 static volatile bool s_ws_closing = false;
 static volatile bool s_waiting_server_reply = false;
+static volatile bool s_mcp_tool_running = false;
 static volatile int64_t s_wait_reply_since_us = 0;
 static volatile int64_t s_last_activity_us = 0;
 
@@ -561,6 +562,10 @@ static void xz_mcp_worker_task(void *arg)
                 const cJSON *jpay = cJSON_GetObjectItemCaseSensitive(root, "payload");
                 const cJSON *jm = jpay ? cJSON_GetObjectItemCaseSensitive(jpay, "method") : NULL;
                 const char *mname = (cJSON_IsString(jm) && jm->valuestring) ? jm->valuestring : "";
+                bool is_tool_call = (strcmp(mname, "tools/call") == 0);
+                if (is_tool_call) {
+                    s_mcp_tool_running = true;
+                }
                 char *reply = xz_mcp_handle_payload(job.sid, jpay, &s_hooks);
                 if (reply) {
                     int rlen = (int)strlen(reply);
@@ -568,6 +573,10 @@ static void xz_mcp_worker_task(void *arg)
                     s_diag_last_mcp_sent = sret;
                     ESP_LOGI(TAG, "MCP reply (%s, %d B, sent=%d)", mname, rlen, sret);
                     free(reply);
+                }
+                if (is_tool_call) {
+                    s_mcp_tool_running = false;
+                    s_wait_reply_since_us = esp_timer_get_time();
                 }
                 if (strcmp(mname, "tools/list") == 0) {
                     xEventGroupSetBits(s_ev, XZ_EVT_MCP_READY);
@@ -689,6 +698,7 @@ static void handle_ws_json(const char *txt)
     } else if (strcmp(type, "goodbye") == 0) {
         s_tts_stop_pending = false;
         s_waiting_server_reply = false;
+        s_mcp_tool_running = false;
         s_auto_chat_active = false;
         xz_lock();
         if (s_st.state == XZ_STATE_LISTENING || s_st.state == XZ_STATE_CONNECTING ||
@@ -725,6 +735,7 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
         if (!s_ws_closing) {
             s_auto_chat_active = false;
             s_waiting_server_reply = false;
+            s_mcp_tool_running = false;
             xz_lock();
             s_st.ws_connected = false;
             s_session_id[0] = '\0';
@@ -1083,12 +1094,15 @@ static void xz_audio_task(void *arg)
 
         if (st == XZ_STATE_LISTENING && pcm && opus_out) {
             static int32_t s_dc_x1 = 0, s_dc_y1 = 0;
-            static uint32_t s_vad_noise_floor = 200;
+            static uint32_t s_vad_noise_floor = 180;
             static uint16_t s_vad_speech_cnt = 0;
             static uint16_t s_vad_silence_cnt = 0;
             static uint8_t s_warmup_frames = 0;
             static bool s_vad_has_spoken = false;
             static bool s_vad_stop_sent = false;
+            static uint32_t s_tx_ok = 0, s_tx_drop = 0;
+            static uint16_t s_tx_max_peak = 0;
+            static int64_t s_tx_log_us = 0;
 
             if (bsp_audio_is_wake_active()) {
                 bsp_audio_wake_end();
@@ -1102,21 +1116,22 @@ static void xz_audio_task(void *arg)
                 s_opus_reset_req = false;
                 s_dc_x1 = 0;
                 s_dc_y1 = 0;
-                s_vad_noise_floor = 200;
+                s_vad_noise_floor = 180;
                 s_vad_speech_cnt = 0;
                 s_vad_silence_cnt = 0;
                 s_warmup_frames = 5; /* 300ms blanking of ES7210 turn-on pop & stale TTS RX DMA echo */
                 s_vad_has_spoken = false;
                 s_vad_stop_sent = false;
+                s_tx_ok = 0;
+                s_tx_drop = 0;
+                s_diag_tx_ok = 0;
+                s_diag_tx_drop = 0;
                 s_diag_vad_spoken = false;
                 s_diag_vad_sil = 0;
                 s_diag_vad_floor = s_vad_noise_floor;
                 opus_encoder_ctl(s_opus_enc, OPUS_RESET_STATE);
             }
             if (bsp_audio_has_mic() && bsp_audio_is_voice_active() && s_opus_enc) {
-                static uint32_t s_tx_ok = 0, s_tx_drop = 0;
-                static uint16_t s_tx_max_peak = 0;
-                static int64_t s_tx_log_us = 0;
                 uint16_t raw_peak = 0;
                 if (bsp_audio_voice_read(pcm, XZ_FRAME_SAMPLES, &raw_peak) == ESP_OK) {
                     /* 1st-order DC-blocking high-pass filter: y[n] = x[n] - x[n-1] + 0.995*y[n-1] */
@@ -1145,25 +1160,27 @@ static void xz_audio_task(void *arg)
 
                     if (s_warmup_frames > 0) {
                         s_warmup_frames--;
-                        if (s_warmup_frames == 0 && avg_abs < 1200) {
+                        if (s_warmup_frames == 0 && avg_abs < 600) {
                             uint32_t nf = avg_abs;
-                            if (nf < 100) nf = 100;
-                            if (nf > 650) nf = 650;
+                            if (nf < 80) nf = 80;
+                            if (nf > 350) nf = 350;
                             s_vad_noise_floor = nf;
                             s_diag_vad_floor = nf;
                         }
                         memset(pcm, 0, XZ_FRAME_SAMPLES * sizeof(int16_t));
                         peak = 0;
                     } else {
-                        if (!s_vad_has_spoken && avg_abs < 750 && peak < 2000) {
+                        /* Only update noise floor during quiet periods: peak must be modest and under 650 */
+                        if (!s_vad_has_spoken && peak < s_vad_noise_floor * 2U + 180U && avg_abs < s_vad_noise_floor + 50U && peak < 650) {
                             s_vad_noise_floor = (s_vad_noise_floor * 7U + avg_abs) / 8U;
-                            if (s_vad_noise_floor < 100) s_vad_noise_floor = 100;
-                            if (s_vad_noise_floor > 700) s_vad_noise_floor = 700;
+                            if (s_vad_noise_floor < 80) s_vad_noise_floor = 80;
+                            if (s_vad_noise_floor > 350) s_vad_noise_floor = 350;
                         }
                         s_diag_vad_floor = s_vad_noise_floor;
 
-                        bool is_speech = (avg_abs > s_vad_noise_floor * 2U + 120U) &&
-                                         (peak > s_vad_noise_floor * 3U + 600U);
+                        bool is_speech = ((avg_abs > s_vad_noise_floor * 2U + 80U) && (peak > s_vad_noise_floor * 3U + 450U)) ||
+                                         (peak >= 1400U && avg_abs > s_vad_noise_floor + 60U);
+
                         if (is_speech) {
                             s_vad_speech_cnt++;
                             s_vad_silence_cnt = 0;
@@ -1183,6 +1200,7 @@ static void xz_audio_task(void *arg)
                             if (s_vad_speech_cnt > 0) {
                                 s_vad_speech_cnt--;
                             }
+                            /* Idle silence while waiting for user to speak: do NOT send listen/stop */
                         } else {
                             s_vad_silence_cnt++;
                             s_diag_vad_sil = s_vad_silence_cnt;
@@ -1192,7 +1210,7 @@ static void xz_audio_task(void *arg)
                                 memset(pcm, 0, XZ_FRAME_SAMPLES * sizeof(int16_t));
                                 peak = 0;
                             }
-                            if (s_vad_silence_cnt >= 20 && !s_vad_stop_sent) {
+                            if (s_vad_silence_cnt >= 20 && !s_vad_stop_sent) { /* ~1.2s of silence ends speech */
                                 s_vad_stop_sent = true;
                                 s_waiting_server_reply = true;
                                 s_wait_reply_since_us = esp_timer_get_time();
@@ -1415,6 +1433,7 @@ static void end_overlay_session_sync(bool notify_ui)
     s_overlay_active = false;
     s_auto_chat_active = false;
     s_waiting_server_reply = false;
+    s_mcp_tool_running = false;
     flush_play_queue();
     s_tts_stop_pending = false;
     ws_close_client();
@@ -1517,8 +1536,9 @@ static void xz_ctrl_task(void *arg)
                 }
             }
             /* Recovery: if server did not reply within 5s after end-of-speech (e.g. ASR empty on noise),
-             * reopen auto listening so user can speak immediately */
-            if (s_waiting_server_reply && s_st.state == XZ_STATE_LISTENING &&
+             * reopen auto listening so user can speak immediately.
+             * NEVER trigger this while an MCP tool call is actively executing! */
+            if (s_waiting_server_reply && !s_mcp_tool_running && s_st.state == XZ_STATE_LISTENING &&
                 (now - s_wait_reply_since_us >= 5000000LL)) {
                 if ((s_ui_active || s_overlay_active) && s_auto_chat_active && s_st.ws_connected) {
                     ESP_LOGI(TAG, "Server reply timeout (5s) -> reopening auto listening");
@@ -2007,6 +2027,7 @@ void xz_service_get_diag_json(char *out, size_t max_len)
     cJSON_AddBoolToObject(obj, "auto_chat", s_auto_chat_active);
     cJSON_AddStringToObject(obj, "pc_perm_mode", xz_service_get_pc_perm_mode_str());
     cJSON_AddBoolToObject(obj, "waiting_reply", s_waiting_server_reply);
+    cJSON_AddBoolToObject(obj, "mcp_running", s_mcp_tool_running);
     cJSON_AddBoolToObject(obj, "vad_spoken", s_diag_vad_spoken);
     cJSON_AddNumberToObject(obj, "vad_sil", s_diag_vad_sil);
     cJSON_AddNumberToObject(obj, "vad_floor", (double)s_diag_vad_floor);

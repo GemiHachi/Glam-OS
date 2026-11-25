@@ -142,6 +142,38 @@ bool xz_mcp_on_serial_line(const char *line, bool from_usb_jtag)
         return true;
     }
 
+    if (strcmp(type, "xz_diag") == 0) {
+        const cJSON *jact = cJSON_GetObjectItemCaseSensitive(root, "action");
+        if (cJSON_IsString(jact) && jact->valuestring) {
+            if (strcmp(jact->valuestring, "wakeup") == 0) {
+                xz_service_trigger_wakeup();
+            } else if (strcmp(jact->valuestring, "text") == 0) {
+                const cJSON *jq = cJSON_GetObjectItemCaseSensitive(root, "q");
+                if (cJSON_IsString(jq) && jq->valuestring) {
+                    xz_service_send_text(jq->valuestring);
+                } else {
+                    xz_service_send_text("你好");
+                }
+            } else if (strcmp(jact->valuestring, "dismiss") == 0) {
+                xz_service_dismiss_overlay();
+            }
+        }
+        char *diag_buf = (char *)malloc(768);
+        if (diag_buf) {
+            diag_buf[0] = '\0';
+            xz_service_get_diag_json(diag_buf, 768);
+            char *resp = (char *)malloc(832);
+            if (resp) {
+                snprintf(resp, 832, "\n{\"type\":\"xz_diag_resp\",\"diag\":%s}\n", diag_buf[0] ? diag_buf : "{}");
+                os_installer_serial_send(resp, strlen(resp));
+                free(resp);
+            }
+            free(diag_buf);
+        }
+        cJSON_Delete(root);
+        return true;
+    }
+
     if (strcmp(type, "pc_mcp_resp") == 0) {
         s_last_usb_hb_us = esp_timer_get_time();
         submit_pc_response_root(root);
@@ -225,7 +257,7 @@ static cJSON *build_schema_req1(const char *req_name, const char *req_type, cons
     return s;
 }
 
-static cJSON *build_tools_list_result(void)
+static cJSON *build_tools_list_result(bool with_user_tools)
 {
     cJSON *res = cJSON_CreateObject();
     cJSON *tools = cJSON_AddArrayToObject(res, "tools");
@@ -328,22 +360,7 @@ static cJSON *build_tools_list_result(void)
             s));
     }
 
-    /* 12. Background Wake-Word Toggle */
-    {
-        cJSON *s = build_schema_req1("enabled", "boolean", NULL, NULL);
-        cJSON_AddItemToArray(tools, build_tool_def(
-            "self.xiaozhi.set_wakeup",
-            "Toggle wake word.",
-            s));
-    }
-
-    /* 13. System Reboot */
-    cJSON_AddItemToArray(tools, build_tool_def(
-        "self.system.reboot",
-        "Reboot.",
-        build_schema_empty()));
-
-    /* 14. Windows PC Unified Control (fast direct actions) */
+    /* 12. Windows PC Unified Control (fast direct actions) */
     {
         cJSON *props = NULL;
         cJSON *s = build_schema_req1("action", "string", NULL, &props);
@@ -352,22 +369,22 @@ static cJSON *build_tools_list_result(void)
         schema_add_prop(props, "confirm_id", "string", NULL);
         cJSON_AddItemToArray(tools, build_tool_def(
             "pc.control",
-            "PC control. action: get_status,open_app,close_app,focus_window,min_window,max_window,list_windows,open_url,search_web,new_tab,close_tab,next_tab,prev_tab,refresh,back,forward,scroll_down,scroll_up,fullscreen,hotkey,type_text,press_key,mouse_click,mouse_scroll,set_volume,volume_up,volume_down,mute,media_play_pause,media_next,media_prev,lock_screen,sleep,show_desktop,screenshot,get_clipboard,set_clipboard,open_path,list_dir,search_file,read_text,write_text,shell,inspect_ui,click_element,type_element. GUI/Bilibili click->pc.ai_agent; MCP->pc.ext_mcp.",
+            "PC control. action: get_status,open_app,close_app,focus_window,list_windows,open_url,search_web,hotkey,type_text,press_key,mouse_click,set_volume,volume_up,volume_down,mute,media_play_pause,screenshot,shell. GUI click->pc.ai_agent.",
             s));
     }
 
-    /* 15. PC Local Vision Computer-Use Sub-Agent */
+    /* 13. PC Local Vision Computer-Use Sub-Agent */
     {
         cJSON *props = NULL;
         cJSON *s = build_schema_req1("goal", "string", NULL, &props);
         schema_add_prop(props, "confirm_id", "string", NULL);
         cJSON_AddItemToArray(tools, build_tool_def(
             "pc.ai_agent",
-            "PC Vision+UIA GUI agent. ALWAYS use to click videos/links/buttons on Bilibili/web/apps or multi-step GUI.",
+            "PC Vision GUI agent. Click videos/buttons/UI.",
             s));
     }
 
-    /* 16. PC External Mounted MCP Servers */
+    /* 14. PC External Mounted MCP Servers */
     {
         cJSON *props = NULL;
         cJSON *s = build_schema_req1("action", "string", "list|call", &props);
@@ -376,11 +393,11 @@ static cJSON *build_tools_list_result(void)
         schema_add_prop(props, "confirm_id", "string", NULL);
         cJSON_AddItemToArray(tools, build_tool_def(
             "pc.ext_mcp",
-            "External PC MCP tools. Run action=list first, then call.",
+            "External PC MCP. list|call.",
             s));
     }
 
-    /* 17. Native SolidWorks 3D CAD Automation (COM/VBScript) */
+    /* 15. Native SolidWorks 3D CAD Automation (COM/VBScript) */
     {
         cJSON *props = NULL;
         cJSON *s = build_schema_req1("action", "string",
@@ -391,14 +408,32 @@ static cJSON *build_tools_list_result(void)
         schema_add_prop(props, "height", "number", NULL);
         schema_add_prop(props, "diameter", "number", NULL);
         schema_add_prop(props, "od", "number", NULL);
-        schema_add_prop(props, "id", "number", NULL);
-        schema_add_prop(props, "view", "string", "iso,front,top,right,zoom_fit");
-        schema_add_prop(props, "path", "string", ".SLDPRT/.STEP/.STL/.PNG");
+        schema_add_prop(props, "inner_dia", "number", NULL);
+        schema_add_prop(props, "view", "string", "iso,front,top,right");
+        schema_add_prop(props, "path", "string", NULL);
         schema_add_prop(props, "confirm_id", "string", NULL);
         cJSON_AddItemToArray(tools, build_tool_def(
             "pc.solidworks",
-            "SolidWorks CAD COM (mm). Use instead of pc.ai_agent for SolidWorks/CAD/extrude/export.",
+            "SolidWorks 3D CAD COM (mm). Actions: get_status,new_part,create_box,create_cylinder,create_tube,view,rebuild,save,ai_model.",
             s));
+    }
+
+    /* Privileged user-only tools: only included when withUserTools is requested */
+    if (with_user_tools) {
+        /* Background Wake-Word Toggle */
+        {
+            cJSON *s = build_schema_req1("enabled", "boolean", NULL, NULL);
+            cJSON_AddItemToArray(tools, build_tool_def(
+                "self.xiaozhi.set_wakeup",
+                "Toggle wake word.",
+                s));
+        }
+
+        /* System Reboot */
+        cJSON_AddItemToArray(tools, build_tool_def(
+            "self.system.reboot",
+            "Reboot.",
+            build_schema_empty()));
     }
 
     return res;
@@ -500,7 +535,7 @@ static cJSON *forward_pc_tool_call(const char *tool_name, const cJSON *jargs, co
     }
     free(req_str);
 
-    int wait_ms = pc_online ? (is_sw ? 28000 : (is_auto_task ? 20000 : 12000)) : 2000;
+    int wait_ms = pc_online ? (is_sw ? 14000 : (is_auto_task ? 14000 : 10000)) : 2000;
     xSemaphoreTake(s_pc_done_sem, pdMS_TO_TICKS(wait_ms));
 
     bool ready = false;
@@ -785,7 +820,13 @@ char *xz_mcp_handle_payload(const char *session_id, const cJSON *payload, const 
         cJSON_AddStringToObject(info, "version", "2.0.0");
         cJSON_AddItemToObject(resp_payload, "result", res);
     } else if (strcmp(method, "tools/list") == 0) {
-        cJSON_AddItemToObject(resp_payload, "result", build_tools_list_result());
+        const cJSON *params = cJSON_GetObjectItemCaseSensitive(payload, "params");
+        bool with_user_tools = false;
+        if (params) {
+            const cJSON *wut = cJSON_GetObjectItemCaseSensitive(params, "withUserTools");
+            if (cJSON_IsBool(wut) && cJSON_IsTrue(wut)) with_user_tools = true;
+        }
+        cJSON_AddItemToObject(resp_payload, "result", build_tools_list_result(with_user_tools));
     } else if (strcmp(method, "tools/call") == 0) {
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(payload, "params");
         cJSON_AddItemToObject(resp_payload, "result", handle_tool_call(params, hooks));
